@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="360" viewBox="0 0 720 360" role="img" aria-labelledby="title desc">
+  <title id="title">OpenTerm source composition</title>
+  <desc id="desc">Pie chart of non-empty source lines in Rust, Go, C, and Zig. Build scripts are excluded.</desc>
+  <rect width="720" height="360" rx="12" fill="#0d1117"/>
+  <path d="M 190 180 L 190 48 A 132 132 0 1 1 80.372 106.477 Z" fill="#dea584" stroke="#0d1117" stroke-width="2"/>
+  <text x="228.517" y="252.209" fill="#ffffff" font-family="Segoe UI, sans-serif" font-size="16" font-weight="600" text-anchor="middle" dominant-baseline="middle">84.4%</text>
+  <rect x="390" y="98" width="18" height="18" rx="3" fill="#dea584"/>
+  <text x="420" y="112" fill="#f0f6fc" font-family="Segoe UI, sans-serif" font-size="17">Rust</text>
+  <text x="550" y="112" fill="#8b949e" font-family="Segoe UI, sans-serif" font-size="15">84.4% &#183; 9,962 lines</text>
+  <path d="M 190 180 L 80.372 106.477 A 132 132 0 0 1 159.979 51.459 Z" fill="#00add8" stroke="#0d1117" stroke-width="2"/>
+  <text x="143.47" y="112.674" fill="#ffffff" font-family="Segoe UI, sans-serif" font-size="16" font-weight="600" text-anchor="middle" dominant-baseline="middle">11.9%</text>
+  <rect x="390" y="146" width="18" height="18" rx="3" fill="#00add8"/>
+  <text x="420" y="160" fill="#f0f6fc" font-family="Segoe UI, sans-serif" font-size="17">Go</text>
+  <text x="550" y="160" fill="#8b949e" font-family="Segoe UI, sans-serif" font-size="15">11.9% &#183; 1,410 lines</text>
+  <path d="M 190 180 L 159.979 51.459 A 132 132 0 0 1 179.471 48.421 Z" fill="#555555" stroke="#0d1117" stroke-width="2"/>
+  <rect x="390" y="194" width="18" height="18" rx="3" fill="#555555"/>
+  <text x="420" y="208" fill="#f0f6fc" font-family="Segoe UI, sans-serif" font-size="17">C</text>
+  <text x="550" y="208" fill="#8b949e" font-family="Segoe UI, sans-serif" font-size="15">2.4% &#183; 281 lines</text>
+  <path d="M 190 180 L 179.471 48.421 A 132 132 0 0 1 190 48 Z" fill="#f7a41d" stroke="#0d1117" stroke-width="2"/>
+  <rect x="390" y="242" width="18" height="18" rx="3" fill="#f7a41d"/>
+  <text x="420" y="256" fill="#f0f6fc" font-family="Segoe UI, sans-serif" font-size="17">Zig</text>
+  <text x="550" y="256" fill="#8b949e" font-family="Segoe UI, sans-serif" font-size="15">1.3% &#183; 150 lines</text>
+</svg>

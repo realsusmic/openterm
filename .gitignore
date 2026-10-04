@@ -1,0 +1,35 @@
+# Rust, Zig, C, and Go build output
+/target/
+/dist/
+/agent/otm-agent
+/agent/otm-agent.exe
+/native/*.o
+/native/*.obj
+/native/*.a
+/native/*.lib
+*.pdb
+*.ilk
+
+# Local OpenTerm configuration and secrets
+/openterm.ini
+*.vault
+.env
+.env.*
+!.env.example
+
+# SSH private keys must never enter the repository
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+*.pem
+*.key
+
+# Editors, operating systems, and scratch files
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*~

@@ -1,0 +1,18 @@
+* text=auto
+
+*.sh text eol=lf
+*.rs text eol=lf
+*.go text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.zig text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+*.ttf binary
+*.png binary
+*.ico binary
+*.syso binary
