@@ -1277,12 +1277,16 @@ mod tests {
 
     #[derive(Default)]
     struct ParserEvents {
+        printed: Vec<u32>,
         csi: Vec<(u8, Vec<u32>, Vec<u8>)>,
         osc: Vec<Vec<u8>>,
         dcs: Vec<(u8, Vec<u32>, Vec<u8>, Vec<u8>)>,
     }
 
-    extern "C" fn test_print(_: *mut c_void, _: u32) {}
+    extern "C" fn test_print(ud: *mut c_void, codepoint: u32) {
+        let events = unsafe { &mut *(ud as *mut ParserEvents) };
+        events.printed.push(codepoint);
+    }
     extern "C" fn test_exec(_: *mut c_void, _: u8) {}
     extern "C" fn test_esc(_: *mut c_void, _: u8, _: *const u8, _: u8) {}
     extern "C" fn test_csi(
@@ -1387,6 +1391,38 @@ mod tests {
         sequence.extend_from_slice(b"\x1b\\");
         feed(&mut parser, &sequence);
         assert_eq!(events.osc[0].len(), 52usize.to_string().len() + 3 + 4096);
+    }
+
+    #[test]
+    fn parser_rejects_non_canonical_utf8_scalars() {
+        let (mut parser, events) = parser();
+        feed(&mut parser, b"\xC2\x80");
+        feed(&mut parser, b"\xF4\x8F\xBF\xBF");
+        feed(&mut parser, b"\xE0\x80\xAF");
+        feed(&mut parser, b"\xED\xA0\x80");
+        feed(&mut parser, b"\xF4\x90\x80\x80");
+        feed(&mut parser, b"\xC0\xAF");
+
+        assert_eq!(
+            events.printed,
+            [0x80, 0x10FFFF, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD, 0xFFFD]
+        );
+        assert!(!events.printed.contains(&('/' as u32)));
+    }
+
+    #[test]
+    fn invalid_csi_and_dcs_sequences_are_ignored_until_their_terminator() {
+        let (mut parser, events) = parser();
+
+        let mut overflowing_csi = b"\x1b[".to_vec();
+        overflowing_csi.extend_from_slice(b"1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1mA");
+        feed(&mut parser, &overflowing_csi);
+        feed(&mut parser, b"\x1b[1$2mB");
+        feed(&mut parser, b"\x1bP?ignored\x1b\\C");
+
+        assert!(events.csi.is_empty());
+        assert!(events.dcs.is_empty());
+        assert_eq!(events.printed, ['A' as u32, 'B' as u32, 'C' as u32]);
     }
 
     #[test]

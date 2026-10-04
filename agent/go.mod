@@ -1,4 +1,4 @@
-module github.com/susmic/openterm/agent
+module github.com/realsusmic/openterm/agent
 
 go 1.22
 

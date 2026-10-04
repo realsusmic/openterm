@@ -59,9 +59,18 @@ extern "C" {
         n: u32,
         blank: Cell,
     );
-    fn fg_clear_rect(cells: *mut Cell, cols: u32, x: u32, y: u32, w: u32, h: u32, blank: Cell);
-    fn fg_insert_cells(cells: *mut Cell, cols: u32, x: u32, y: u32, n: u32, blank: Cell);
-    fn fg_delete_cells(cells: *mut Cell, cols: u32, x: u32, y: u32, n: u32, blank: Cell);
+    fn fg_clear_rect(
+        cells: *mut Cell,
+        cols: u32,
+        rows: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        blank: Cell,
+    );
+    fn fg_insert_cells(cells: *mut Cell, cols: u32, rows: u32, x: u32, y: u32, n: u32, blank: Cell);
+    fn fg_delete_cells(cells: *mut Cell, cols: u32, rows: u32, x: u32, y: u32, n: u32, blank: Cell);
 }
 
 #[derive(Clone)]
@@ -193,7 +202,18 @@ impl Grid {
                 self.set(right, row, self.blank);
             }
         }
-        unsafe { fg_clear_rect(self.cells.as_mut_ptr(), self.cols, x, y, w, h, self.blank) }
+        unsafe {
+            fg_clear_rect(
+                self.cells.as_mut_ptr(),
+                self.cols,
+                self.rows,
+                x,
+                y,
+                w,
+                h,
+                self.blank,
+            )
+        }
         for row in y..y + h {
             let start = (row * self.cols + x) as usize;
             self.links[start..start + w as usize].fill(0);
@@ -203,7 +223,17 @@ impl Grid {
         if y >= self.rows {
             return;
         }
-        unsafe { fg_insert_cells(self.cells.as_mut_ptr(), self.cols, x, y, n, self.blank) }
+        unsafe {
+            fg_insert_cells(
+                self.cells.as_mut_ptr(),
+                self.cols,
+                self.rows,
+                x,
+                y,
+                n,
+                self.blank,
+            )
+        }
         let row = (y * self.cols) as usize;
         insert_slice(
             &mut self.links[row..row + self.cols as usize],
@@ -217,7 +247,17 @@ impl Grid {
         if y >= self.rows {
             return;
         }
-        unsafe { fg_delete_cells(self.cells.as_mut_ptr(), self.cols, x, y, n, self.blank) }
+        unsafe {
+            fg_delete_cells(
+                self.cells.as_mut_ptr(),
+                self.cols,
+                self.rows,
+                x,
+                y,
+                n,
+                self.blank,
+            )
+        }
         let row = (y * self.cols) as usize;
         delete_slice(
             &mut self.links[row..row + self.cols as usize],
@@ -312,4 +352,64 @@ fn delete_slice<T: Copy>(row: &mut [T], x: usize, n: usize, blank: T) {
     row.copy_within(x + shift.., x);
     let fill = row.len() - shift;
     row[fill..].fill(blank);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn numbered_cells(count: u32) -> Vec<Cell> {
+        (0..count)
+            .map(|glyph| Cell {
+                glyph,
+                ..Cell::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn native_mutators_reject_out_of_bounds_rows() {
+        let mut cells = numbered_cells(8);
+        let before = cells.clone();
+        let blank = Cell::default();
+
+        unsafe {
+            fg_clear_rect(cells.as_mut_ptr(), 4, 2, 0, 2, 4, 1, blank);
+            fg_insert_cells(cells.as_mut_ptr(), 4, 2, 0, 2, 1, blank);
+            fg_delete_cells(cells.as_mut_ptr(), 4, 2, 0, 2, 1, blank);
+        }
+
+        assert_eq!(cells, before);
+    }
+
+    #[test]
+    fn native_clear_rect_clamps_to_the_grid() {
+        let mut cells = numbered_cells(8);
+        let blank = Cell::default();
+
+        unsafe {
+            fg_clear_rect(cells.as_mut_ptr(), 4, 2, 3, 1, u32::MAX, u32::MAX, blank);
+        }
+
+        assert_eq!(cells[..7], numbered_cells(7));
+        assert_eq!(cells[7], blank);
+    }
+
+    #[test]
+    fn native_cell_shifts_preserve_overlap_direction() {
+        let blank = Cell::default();
+        let mut cells = numbered_cells(5);
+
+        unsafe { fg_insert_cells(cells.as_mut_ptr(), 5, 1, 1, 0, 2, blank) };
+        assert_eq!(
+            cells.iter().map(|cell| cell.glyph).collect::<Vec<_>>(),
+            [0, blank.glyph, blank.glyph, 1, 2]
+        );
+
+        unsafe { fg_delete_cells(cells.as_mut_ptr(), 5, 1, 1, 0, 2, blank) };
+        assert_eq!(
+            cells.iter().map(|cell| cell.glyph).collect::<Vec<_>>(),
+            [0, 1, 2, blank.glyph, blank.glyph]
+        );
+    }
 }

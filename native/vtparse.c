@@ -14,7 +14,7 @@ typedef enum {
     S_GROUND = 0, S_ESC, S_ESC_INT,
     S_CSI_ENTRY, S_CSI_PARAM, S_CSI_INT, S_CSI_IGNORE,
     S_OSC_STRING, S_OSC_ESC,
-    S_DCS_ENTRY, S_DCS_PASS, S_DCS_ESC, S_DCS_IGNORE,
+    S_DCS_ENTRY, S_DCS_PASS, S_DCS_ESC, S_DCS_IGNORE, S_DCS_IGNORE_ESC,
     S_SOS_PM_APC, S_SOS_PM_APC_ESC
 } vt_state_t;
 
@@ -29,6 +29,7 @@ struct vt_parser {
     uint32_t string_len;
     uint8_t  dcs_final;
     uint32_t utf8_cp;
+    uint32_t utf8_min;
     uint8_t  utf8_need;
 
     vt_cb_print    cb_print;
@@ -64,22 +65,22 @@ void vt_set_callbacks(struct vt_parser *p,
     p->userdata   = userdata;
 }
 
-static inline void push_param(struct vt_parser *p, uint8_t b) {
+static inline int push_param(struct vt_parser *p, uint8_t b) {
     if (p->n_params == 0) p->n_params = 1;
-    if (p->n_params > VT_MAX_PARAMS) return;
+    if (p->n_params > VT_MAX_PARAMS) return 0;
     uint32_t *cur = &p->params[p->n_params - 1];
     if (b == ';' || b == ':') {
-        if (p->n_params < VT_MAX_PARAMS) {
-            uint8_t next = p->n_params;
-            p->n_params++;
-            p->params[p->n_params - 1] = 0;
-            p->subparams[next] = (b == ':');
-        }
+        if (p->n_params >= VT_MAX_PARAMS) return 0;
+        uint8_t next = p->n_params;
+        p->n_params++;
+        p->params[p->n_params - 1] = 0;
+        p->subparams[next] = (b == ':');
     } else {
         uint64_t v = (uint64_t)(*cur) * 10 + (uint64_t)(b - '0');
         if (v > 0xFFFFu) v = 0xFFFF;
         *cur = (uint32_t)v;
     }
+    return 1;
 }
 
 static inline void clear_params(struct vt_parser *p) {
@@ -147,6 +148,15 @@ void vt_feed(struct vt_parser *p, const uint8_t *data, size_t len) {
             }
             continue;
         }
+        if (p->state == S_DCS_IGNORE) {
+            if (b == 0x9C) p->state = S_GROUND;
+            else if (b == 0x1B) p->state = S_DCS_IGNORE_ESC;
+            continue;
+        }
+        if (p->state == S_DCS_IGNORE_ESC) {
+            p->state = (b == '\\') ? S_GROUND : S_DCS_IGNORE;
+            continue;
+        }
         if (p->state == S_SOS_PM_APC) {
             if (b == 0x9C) p->state = S_GROUND;
             else if (b == 0x1B) p->state = S_SOS_PM_APC_ESC;
@@ -160,6 +170,7 @@ void vt_feed(struct vt_parser *p, const uint8_t *data, size_t len) {
         /* mid-sequence utf-8 interrupted by a non-continuation byte: emit U+FFFD */
         if (p->utf8_need && (b & 0xC0) != 0x80) {
             p->utf8_need = 0;
+            p->utf8_min = 0;
             if (p->cb_print) p->cb_print(p->userdata, 0xFFFD);
         }
 
@@ -170,11 +181,22 @@ void vt_feed(struct vt_parser *p, const uint8_t *data, size_t len) {
             if (b >= 0x80) {
                 if (p->utf8_need) {                       /* continuation */
                     p->utf8_cp = (p->utf8_cp << 6) | (b & 0x3F);
-                    if (--p->utf8_need == 0 && p->cb_print)
-                        p->cb_print(p->userdata, p->utf8_cp);
-                } else if ((b & 0xE0) == 0xC0) { p->utf8_cp = b & 0x1F; p->utf8_need = 1; }
-                else if   ((b & 0xF0) == 0xE0) { p->utf8_cp = b & 0x0F; p->utf8_need = 2; }
-                else if   ((b & 0xF8) == 0xF0) { p->utf8_cp = b & 0x07; p->utf8_need = 3; }
+                    if (--p->utf8_need == 0) {
+                        uint32_t cp = p->utf8_cp;
+                        if (cp < p->utf8_min || (cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x10FFFF)
+                            cp = 0xFFFD;
+                        p->utf8_min = 0;
+                        if (p->cb_print) p->cb_print(p->userdata, cp);
+                    }
+                } else if (b >= 0xC2 && b <= 0xDF) {
+                    p->utf8_cp = b & 0x1F; p->utf8_min = 0x80; p->utf8_need = 1;
+                }
+                else if (b >= 0xE0 && b <= 0xEF) {
+                    p->utf8_cp = b & 0x0F; p->utf8_min = 0x800; p->utf8_need = 2;
+                }
+                else if (b >= 0xF0 && b <= 0xF4) {
+                    p->utf8_cp = b & 0x07; p->utf8_min = 0x10000; p->utf8_need = 3;
+                }
                 else if (p->cb_print) p->cb_print(p->userdata, 0xFFFD); /* stray continuation */
             } else if (b < 0x20 || b == 0x7F) {
                 if (p->cb_execute) p->cb_execute(p->userdata, b);
@@ -209,16 +231,19 @@ void vt_feed(struct vt_parser *p, const uint8_t *data, size_t len) {
             break;
 
         case S_CSI_ENTRY:
-            if (b >= '0' && b <= '9') { push_param(p, b); p->state = S_CSI_PARAM; }
-            else if (b == ';') { push_param(p, b); p->state = S_CSI_PARAM; }
+            if ((b >= '0' && b <= '9') || b == ';' || b == ':') {
+                p->state = push_param(p, b) ? S_CSI_PARAM : S_CSI_IGNORE;
+            }
             else if (b == '?' || b == '>' || b == '<' || b == '=') {
                 if (p->n_intermediate < VT_MAX_INTERMEDIATE)
                     p->intermediate[p->n_intermediate++] = b;
-                p->state = S_CSI_PARAM;
+                else p->state = S_CSI_IGNORE;
+                if (p->state != S_CSI_IGNORE) p->state = S_CSI_PARAM;
             } else if (b >= 0x20 && b <= 0x2F) {
                 if (p->n_intermediate < VT_MAX_INTERMEDIATE)
                     p->intermediate[p->n_intermediate++] = b;
-                p->state = S_CSI_INT;
+                else p->state = S_CSI_IGNORE;
+                if (p->state != S_CSI_IGNORE) p->state = S_CSI_INT;
             } else if (b >= 0x40 && b <= 0x7E) {
                 if (p->cb_csi) p->cb_csi(p->userdata, b, p->params, p->n_params,
                                          p->subparams, p->intermediate, p->n_intermediate);
@@ -227,11 +252,15 @@ void vt_feed(struct vt_parser *p, const uint8_t *data, size_t len) {
             break;
 
         case S_CSI_PARAM:
-            if ((b >= '0' && b <= '9') || b == ';' || b == ':') push_param(p, b);
+            if ((b >= '0' && b <= '9') || b == ';' || b == ':') {
+                if (!push_param(p, b)) p->state = S_CSI_IGNORE;
+            }
+            else if (b >= 0x3C && b <= 0x3F) p->state = S_CSI_IGNORE;
             else if (b >= 0x20 && b <= 0x2F) {
                 if (p->n_intermediate < VT_MAX_INTERMEDIATE)
                     p->intermediate[p->n_intermediate++] = b;
-                p->state = S_CSI_INT;
+                else p->state = S_CSI_IGNORE;
+                if (p->state != S_CSI_IGNORE) p->state = S_CSI_INT;
             } else if (b >= 0x40 && b <= 0x7E) {
                 if (p->cb_csi) p->cb_csi(p->userdata, b, p->params, p->n_params,
                                          p->subparams, p->intermediate, p->n_intermediate);
@@ -240,7 +269,12 @@ void vt_feed(struct vt_parser *p, const uint8_t *data, size_t len) {
             break;
 
         case S_CSI_INT:
-            if (b >= 0x40 && b <= 0x7E) {
+            if (b >= 0x30 && b <= 0x3F) p->state = S_CSI_IGNORE;
+            else if (b >= 0x20 && b <= 0x2F) {
+                if (p->n_intermediate < VT_MAX_INTERMEDIATE)
+                    p->intermediate[p->n_intermediate++] = b;
+                else p->state = S_CSI_IGNORE;
+            } else if (b >= 0x40 && b <= 0x7E) {
                 if (p->cb_csi) p->cb_csi(p->userdata, b, p->params, p->n_params,
                                          p->subparams, p->intermediate, p->n_intermediate);
                 p->state = S_GROUND;
@@ -252,10 +286,14 @@ void vt_feed(struct vt_parser *p, const uint8_t *data, size_t len) {
             break;
 
         case S_DCS_ENTRY:
-            if ((b >= '0' && b <= '9') || b == ';' || b == ':') push_param(p, b);
+            if ((b >= '0' && b <= '9') || b == ';' || b == ':') {
+                if (!push_param(p, b)) p->state = S_DCS_IGNORE;
+            }
+            else if (b >= 0x3C && b <= 0x3F) p->state = S_DCS_IGNORE;
             else if (b >= 0x20 && b <= 0x2F) {
                 if (p->n_intermediate < VT_MAX_INTERMEDIATE)
                     p->intermediate[p->n_intermediate++] = b;
+                else p->state = S_DCS_IGNORE;
             } else if (b >= 0x40 && b <= 0x7E) {
                 p->dcs_final = b;
                 p->string_len = 0;
@@ -263,9 +301,7 @@ void vt_feed(struct vt_parser *p, const uint8_t *data, size_t len) {
             }
             break;
         case S_DCS_IGNORE:
-            if (b == 0x9C) p->state = S_GROUND;
-            else if (b == 0x1B) p->state = S_SOS_PM_APC_ESC;
-            break;
+        case S_DCS_IGNORE_ESC:
         case S_OSC_STRING:
         case S_OSC_ESC:
         case S_DCS_PASS:
