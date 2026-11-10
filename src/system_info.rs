@@ -57,7 +57,7 @@ const WINDOWS_POWERSHELL_SCRIPT: &str = r#"$os=Get-CimInstance Win32_OperatingSy
 // shortcut (wmic, powershell shellout, cmd /v:on /c) is either dead or
 // banned by the one-liner test below. The seven-key contract still holds —
 // only the uptime value shape differs on cmd.
-const WINDOWS_CMD_SCRIPT: &str = r#"@systeminfo>"%TEMP%\sys.info" 2>nul & for /f "tokens=1,* delims=:" %a in ('findstr /B /C:"OS Name" "%TEMP%\sys.info"') do @for /f "tokens=*" %c in ("%b") do @echo os      %c & for /f "tokens=1,* delims=:" %a in ('findstr /B /C:"OS Version" "%TEMP%\sys.info"') do @for /f "tokens=1" %c in ("%b") do @echo kernel  %c & echo shell   cmd & for /f "tokens=1,* delims=:" %a in ('findstr /B /C:"System Boot Time" "%TEMP%\sys.info"') do @for /f "tokens=*" %c in ("%b") do @echo uptime  since %c & for /f "tokens=2,*" %a in ('reg query "HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0" /v ProcessorNameString 2^>nul') do @echo cpu     %b - %NUMBER_OF_PROCESSORS%c & set "a_mb=" & set "t_mb=" & for /f "tokens=1,* delims=:" %a in ('findstr /B /C:"Available Physical Memory" "%TEMP%\sys.info"') do @for /f "tokens=1" %c in ("%b") do @set "a_mb=%c" & for /f "tokens=1,* delims=:" %a in ('findstr /B /C:"Total Physical Memory" "%TEMP%\sys.info"') do @for /f "tokens=1" %c in ("%b") do @set "t_mb=%c" & call set "a_mb=%%a_mb:,=%%" & call set "t_mb=%%t_mb:,=%%" & call set /a "u_mb=%%t_mb%%-%%a_mb%%" >nul 2>&1 & call set /a "uw=%%u_mb%%/1024" >nul 2>&1 & call set /a "ut=(%%u_mb%% - %%u_mb%%/1024*1024)*10/1024" >nul 2>&1 & call set /a "tw=%%t_mb%%/1024" >nul 2>&1 & call set /a "tt=(%%t_mb%% - %%t_mb%%/1024*1024)*10/1024" >nul 2>&1 & call echo memory  %%uw%%.%%ut%% GiB / %%tw%%.%%tt%% GiB & if defined WT_SESSION echo term    Generic & if not defined WT_SESSION echo term    conhost & del "%TEMP%\sys.info" >nul 2>&1"#;
+const WINDOWS_CMD_SCRIPT: &str = r#"@systeminfo>"%TEMP%\sys.info" 2>nul & for /f "tokens=1,* delims=:" %a in ('findstr /B /C:"OS Name" "%TEMP%\sys.info"') do @for /f "tokens=*" %c in ("%b") do @echo os      %c & for /f "tokens=1,* delims=:" %a in ('findstr /B /C:"OS Version" "%TEMP%\sys.info"') do @for /f "tokens=1" %c in ("%b") do @echo kernel  %c & echo shell   cmd & for /f "tokens=1,* delims=:" %a in ('findstr /B /C:"System Boot Time" "%TEMP%\sys.info"') do @for /f "tokens=*" %c in ("%b") do @echo uptime  since %c & for /f "tokens=2,*" %a in ('reg query "HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0" /v ProcessorNameString 2^>nul') do @echo cpu     %b - %NUMBER_OF_PROCESSORS%c & set /a "a_mb=0,t_mb=0" >nul & for /f "tokens=1,* delims=:" %a in ('findstr /B /C:"Available Physical Memory" "%TEMP%\sys.info"') do @for /f "tokens=1,2 delims=," %c in ("%b") do @for /f "tokens=1" %e in ("%d") do @set /a "a_mb=%c*1000+%e" >nul & for /f "tokens=1,* delims=:" %a in ('findstr /B /C:"Total Physical Memory" "%TEMP%\sys.info"') do @for /f "tokens=1,2 delims=," %c in ("%b") do @for /f "tokens=1" %e in ("%d") do @set /a "t_mb=%c*1000+%e,u_mb=t_mb-a_mb" >nul & for /f %u in ('set /a "u_mb/1024"') do @for /f %v in ('set /a "(u_mb-u_mb/1024*1024)*10/1024"') do @for /f %w in ('set /a "t_mb/1024"') do @for /f %x in ('set /a "(t_mb-t_mb/1024*1024)*10/1024"') do @echo memory  %u.%v GiB / %w.%x GiB & echo term    openterm & del "%TEMP%\sys.info" >nul 2>&1"#;
 
 /// Native startup summary. This remains useful before a shell is ready; the
 /// toolbar action uses `command` so its output stays in terminal history.
@@ -188,6 +188,43 @@ mod tests {
         assert!(
             !script.contains('\n'),
             "CMD command must remain one physical line"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_script_emits_numeric_memory_without_powershell() {
+        use std::os::windows::process::CommandExt;
+
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/q", "/c"])
+            .raw_arg(WINDOWS_CMD_SCRIPT)
+            .output()
+            .expect("failed to run CMD info script");
+        assert!(
+            output.status.success(),
+            "CMD script exited non-zero\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let lines: Vec<&str> = stdout.lines().filter(|line| !line.is_empty()).collect();
+        assert_eq!(lines.len(), KEYS.len(), "unexpected row count:\n{stdout}");
+        for (line, key) in lines.iter().zip(KEYS) {
+            assert!(
+                line.starts_with(key),
+                "row {line:?} should start with {key}"
+            );
+        }
+        let memory = lines
+            .iter()
+            .find(|line| line.starts_with("memory"))
+            .expect("memory row missing");
+        assert!(memory.contains(" GiB / "), "bad memory row: {memory}");
+        assert!(!memory.contains('%'), "memory variables leaked: {memory}");
+        assert!(
+            !stdout.to_ascii_lowercase().contains("powershell"),
+            "CMD output invoked PowerShell"
         );
     }
 

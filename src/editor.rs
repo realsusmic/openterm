@@ -7,12 +7,17 @@ use egui::{
 use egui_extras::syntax_highlighting::{highlight, CodeTheme};
 use std::path::{Path, PathBuf};
 
+pub const LARGE_FILE_THRESHOLD: u64 = 4 * 1024 * 1024;
+pub const LARGE_FILE_NOTICE: &str = "file is over 4mb, so this may take a while";
+
 pub struct OpenFile {
     pub path: PathBuf,
     pub display_name: String,
     pub text: String,
     pub dirty: bool,
     read_only: bool,
+    large: bool,
+    hex_data: Option<Vec<u8>>,
     lang: String,
     remote: Option<RemoteFile>,
 }
@@ -40,15 +45,12 @@ pub struct Editor {
 pub type Flash = Option<(String, bool)>;
 
 impl Editor {
-    pub fn open(&mut self, path: &Path) -> Result<(), String> {
+    pub fn open_bytes(&mut self, path: &Path, bytes: Vec<u8>) -> Result<(), String> {
         if let Some(i) = self.files.iter().position(|f| f.path == path) {
             self.active = Some(i);
             return Ok(());
         }
-        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-        if bytes.len() > 4 * 1024 * 1024 {
-            return Err("file is over 4 MB".into());
-        }
+        let large = bytes.len() as u64 > LARGE_FILE_THRESHOLD;
         let text = String::from_utf8(bytes).map_err(|_| "not a text file".to_string())?;
         self.files.push(OpenFile {
             path: path.to_path_buf(),
@@ -60,6 +62,8 @@ impl Editor {
             text,
             dirty: false,
             read_only: false,
+            large,
+            hex_data: None,
             lang: lang_for(path),
             remote: None,
         });
@@ -73,9 +77,7 @@ impl Editor {
         remote_path: &str,
         bytes: Vec<u8>,
     ) -> Result<(), String> {
-        if bytes.len() > 4 * 1024 * 1024 {
-            return Err("file is over 4 MB".into());
-        }
+        let large = bytes.len() as u64 > LARGE_FILE_THRESHOLD;
         let key = PathBuf::from(format!("remote-{session_id}")).join(
             remote_path
                 .trim_start_matches(['/', '\\'])
@@ -98,6 +100,8 @@ impl Editor {
             text,
             dirty: false,
             read_only: false,
+            large,
+            hex_data: None,
             lang: lang_for(Path::new(remote_path)),
             remote: Some(RemoteFile {
                 session_id,
@@ -106,6 +110,34 @@ impl Editor {
         });
         self.active = Some(self.files.len() - 1);
         Ok(())
+    }
+
+    pub fn open_hex_bytes(&mut self, path: &Path, bytes: Vec<u8>) {
+        if let Some(i) = self.files.iter().position(|file| file.path == path) {
+            self.files[i].hex_data = Some(bytes);
+            self.files[i].text.clear();
+            self.files[i].read_only = true;
+            self.files[i].dirty = false;
+            self.active = Some(i);
+            return;
+        }
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        self.files.push(OpenFile {
+            path: path.to_path_buf(),
+            display_name: format!("{name} [hex]"),
+            text: String::new(),
+            dirty: false,
+            read_only: true,
+            large: bytes.len() as u64 > LARGE_FILE_THRESHOLD,
+            hex_data: Some(bytes),
+            lang: "txt".into(),
+            remote: None,
+        });
+        self.active = Some(self.files.len() - 1);
     }
 
     fn close(&mut self, i: usize) {
@@ -275,10 +307,15 @@ impl Editor {
         }
 
         let f = &mut self.files[idx];
+        if let Some(bytes) = f.hex_data.as_deref() {
+            hex_view(ui, idx, bytes);
+            return flash;
+        }
         let lines = f.text.lines().count().max(1) + usize::from(f.text.ends_with('\n'));
         let width = lines.to_string().len().max(3);
         let gutter: String = (1..=lines).map(|n| format!("{n:>width$}\n")).collect();
         let lang = f.lang.clone();
+        let large = f.large;
 
         ScrollArea::both()
             .id_salt(("editor_scroll", idx))
@@ -299,7 +336,16 @@ impl Editor {
                         CodeTheme::light(MONO_SIZE)
                     };
                     let mut layouter = |ui: &Ui, text: &str, _w: f32| {
-                        let mut job = highlight(ui.ctx(), ui.style(), &theme, text, &lang);
+                        let mut job = if large {
+                            egui::text::LayoutJob::simple(
+                                text.to_owned(),
+                                mono(MONO_SIZE),
+                                fg(),
+                                f32::INFINITY,
+                            )
+                        } else {
+                            highlight(ui.ctx(), ui.style(), &theme, text, &lang)
+                        };
                         job.wrap.max_width = f32::INFINITY;
                         ui.fonts(|f| f.layout_job(job))
                     };
@@ -320,6 +366,47 @@ impl Editor {
             });
         flash
     }
+}
+
+pub fn is_text_bytes(bytes: &[u8]) -> bool {
+    std::str::from_utf8(bytes).is_ok() && !bytes.contains(&0)
+}
+
+fn hex_view(ui: &mut Ui, index: usize, bytes: &[u8]) {
+    const BYTES_PER_ROW: usize = 16;
+    let rows = bytes.len().div_ceil(BYTES_PER_ROW).max(1);
+    let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+    ScrollArea::both()
+        .id_salt(("editor_hex_scroll", index))
+        .auto_shrink([false, false])
+        .show_rows(ui, row_height, rows, |ui, range| {
+            ui.set_min_width(640.0);
+            for row in range {
+                let start = row * BYTES_PER_ROW;
+                let end = (start + BYTES_PER_ROW).min(bytes.len());
+                let chunk = &bytes[start..end];
+                let mut line = format!("{start:08X}  ");
+                for column in 0..BYTES_PER_ROW {
+                    if let Some(byte) = chunk.get(column) {
+                        line.push_str(&format!("{byte:02X} "));
+                    } else {
+                        line.push_str("   ");
+                    }
+                    if column == 7 {
+                        line.push(' ');
+                    }
+                }
+                line.push_str(" | ");
+                for byte in chunk {
+                    line.push(if byte.is_ascii_graphic() || *byte == b' ' {
+                        char::from(*byte)
+                    } else {
+                        '.'
+                    });
+                }
+                ui.label(egui::RichText::new(line).font(mono(MONO_SIZE)).color(fg()));
+            }
+        });
 }
 
 fn ui_font() -> egui::FontId {
@@ -394,5 +481,34 @@ mod tests {
         editor.finish_remote_save(&first.key, &first.data, Ok(()));
 
         assert!(editor.files[0].dirty);
+    }
+
+    #[test]
+    fn files_over_four_megabytes_use_large_file_mode() {
+        let mut editor = Editor::default();
+        let bytes = vec![b'a'; LARGE_FILE_THRESHOLD as usize + 1];
+
+        editor
+            .open_bytes(Path::new("large.txt"), bytes.clone())
+            .unwrap();
+        editor.open_remote(9, "/srv/large.txt", bytes).unwrap();
+
+        assert!(editor.files[0].large);
+        assert!(editor.files[1].large);
+    }
+
+    #[test]
+    fn binary_detection_and_hex_view_preserve_original_bytes() {
+        assert!(is_text_bytes(b"hello\nworld"));
+        assert!(!is_text_bytes(b"hello\0world"));
+        assert!(!is_text_bytes(&[0xff, 0xfe]));
+
+        let mut editor = Editor::default();
+        editor.open_hex_bytes(Path::new("image.bin"), vec![0, 1, 254, 255]);
+        assert_eq!(
+            editor.files[0].hex_data.as_deref(),
+            Some(&[0, 1, 254, 255][..])
+        );
+        assert!(editor.files[0].read_only);
     }
 }

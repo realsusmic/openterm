@@ -386,7 +386,7 @@ impl Agent {
             ..Default::default()
         })?;
 
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -419,7 +419,7 @@ impl Agent {
                 data: Some(B64.encode(data)),
                 ..Default::default()
             },
-            Duration::from_secs(30),
+            Duration::from_secs(120),
             "remote file save",
         )?;
         Ok(())

@@ -102,6 +102,12 @@ pub fn cross(p: &Painter, c: Pos2, r: f32, col: Color32) {
     p.line_segment([pos2(c.x - r, c.y + r), pos2(c.x + r, c.y - r)], s(col));
 }
 
+pub fn more(p: &Painter, c: Pos2, col: Color32) {
+    for dx in [-4.0, 0.0, 4.0] {
+        p.circle_filled(c + vec2(dx, 0.0), 1.25, col);
+    }
+}
+
 pub fn minimize(p: &Painter, c: Pos2, col: Color32) {
     p.line_segment(
         [pos2(c.x - 5.0, c.y), pos2(c.x + 5.0, c.y)],

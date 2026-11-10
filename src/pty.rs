@@ -112,16 +112,35 @@ pub fn powershell_shell() -> Option<String> {
     }
 }
 
-pub fn bash_shell() -> String {
+pub fn posix_shell() -> Option<String> {
     if cfg!(windows) {
-        which("bash.exe").unwrap_or_else(|| "bash.exe".into())
-    } else {
-        which("bash").unwrap_or_else(|| "/bin/bash".into())
+        return None;
     }
+    std::env::var_os("SHELL")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_file())
+        .map(|path| path.to_string_lossy().into_owned())
+        .or_else(|| which("bash"))
+        .or_else(|| which("zsh"))
+        .or_else(|| which("sh"))
+        .or_else(|| {
+            std::path::Path::new("/bin/sh")
+                .is_file()
+                .then(|| "/bin/sh".into())
+        })
 }
 
-pub fn cmd_shell() -> String {
-    std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into())
+pub fn cmd_shell() -> Option<String> {
+    std::env::var_os("ComSpec")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_file())
+        .map(|path| path.to_string_lossy().into_owned())
+        .or_else(|| which("cmd.exe"))
+        .or_else(|| which("cmd"))
+}
+
+pub fn wsl_shell() -> Option<String> {
+    cfg!(windows).then(|| which("wsl.exe")).flatten()
 }
 
 fn which(bin: &str) -> Option<String> {

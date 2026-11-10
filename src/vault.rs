@@ -560,6 +560,72 @@ impl Vault {
         self.write_record(label, host, port, user, secret, true)
     }
 
+    /// Update one saved machine in place. Keeping the record id stable means
+    /// open UI references remain valid even when its endpoint or label changes.
+    pub fn update(
+        &mut self,
+        id: &str,
+        label: &str,
+        host: &str,
+        port: u16,
+        user: &str,
+        secret: &Secret,
+    ) -> Result<()> {
+        let key = self
+            .key
+            .as_ref()
+            .ok_or_else(|| anyhow!("vault is locked"))?;
+        let index = self
+            .file
+            .records
+            .iter()
+            .position(|record| record.id == id)
+            .ok_or_else(|| anyhow!("no such record"))?;
+        let created = self.file.records[index].created;
+        let cipher = XChaCha20Poly1305::new(key.as_bytes().into());
+        let aad = aad(id, label, host, port, user);
+        let pt = Zeroizing::new(serde_json::to_vec(secret)?);
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let ct = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: &pt,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| anyhow!("encrypt failed"))?;
+        let replacement = Record {
+            id: id.into(),
+            label: label.into(),
+            host: host.into(),
+            port,
+            user: user.into(),
+            created,
+            nonce: B64.encode(nonce_bytes),
+            ct: B64.encode(ct),
+        };
+        let previous = std::mem::replace(&mut self.file.records[index], replacement);
+        if let Err(error) = self.save() {
+            self.file.records[index] = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn rename(&mut self, id: &str, label: &str) -> Result<()> {
+        let record = self
+            .file
+            .records
+            .iter()
+            .find(|record| record.id == id)
+            .cloned()
+            .ok_or_else(|| anyhow!("no such record"))?;
+        let secret = self.decrypt(id)?;
+        self.update(id, label, &record.host, record.port, &record.user, &secret)
+    }
+
     fn write_record(
         &mut self,
         label: &str,
@@ -1070,6 +1136,49 @@ mod tests {
         assert_eq!(reloaded.records()[0].label, "new label");
         match reloaded.decrypt(&first_id).unwrap().to_auth() {
             PlainAuth::Password(password) => assert_eq!(password.as_str(), "second"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn update_and_rename_keep_the_record_id_and_secret_valid() {
+        let (_guard, _dir) = tmp_env();
+        let mut vault = Vault::create(Mode::Password, Some("rightpass")).unwrap();
+        let id = vault
+            .add(
+                "old name",
+                "old.example",
+                22,
+                "alice",
+                &Secret::Password {
+                    password: "first-secret".into(),
+                },
+            )
+            .unwrap();
+
+        vault
+            .update(
+                &id,
+                "edited name",
+                "new.example",
+                2222,
+                "bob",
+                &Secret::Password {
+                    password: "second-secret".into(),
+                },
+            )
+            .unwrap();
+        vault.rename(&id, "final name").unwrap();
+
+        assert_eq!(vault.records().len(), 1);
+        let record = &vault.records()[0];
+        assert_eq!(record.id, id);
+        assert_eq!(record.label, "final name");
+        assert_eq!(record.host, "new.example");
+        assert_eq!(record.port, 2222);
+        assert_eq!(record.user, "bob");
+        match vault.decrypt(&id).unwrap().to_auth() {
+            PlainAuth::Password(password) => assert_eq!(password.as_str(), "second-secret"),
             _ => panic!(),
         }
     }

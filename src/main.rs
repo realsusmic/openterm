@@ -105,9 +105,12 @@ fn main() -> eframe::Result<()> {
     env_logger::init();
     migrate_legacy_window_state();
 
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icons/openterm.png"))
+        .expect("embedded OpenTerm icon must be a valid PNG");
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("OpenTerm")
         .with_app_id(APP_ID)
+        .with_icon(icon)
         // These are logical points, not physical pixels. The old 1280x800
         // default became effectively full-screen on 125-150% Windows scaling.
         .with_inner_size(DEFAULT_WINDOW_SIZE)

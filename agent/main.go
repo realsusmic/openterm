@@ -627,7 +627,9 @@ func (a *Agent) sftpLs(m Msg) {
 	a.send(Msg{ID: m.ID, Ok: true, Path: resolved, Entries: out})
 }
 
-const maxEditorFileSize = 4 * 1024 * 1024
+// The editor switches to a cheaper rendering path above 4 MiB. Keep a much
+// higher safety ceiling here so malformed requests cannot exhaust the agent.
+const maxEditorFileSize = 128 * 1024 * 1024
 
 func (a *Agent) sftpRead(m Msg) {
 	s := a.getSess(m.Session)
@@ -651,7 +653,7 @@ func (a *Agent) sftpRead(m Msg) {
 		return
 	}
 	if len(data) > maxEditorFileSize {
-		a.send(Msg{ID: m.ID, Ok: false, Err: "file is over 4 MB"})
+		a.send(Msg{ID: m.ID, Ok: false, Err: "file exceeds the 128 MB safety limit"})
 		return
 	}
 	a.send(Msg{ID: m.ID, Ok: true, Data: base64.StdEncoding.EncodeToString(data)})
@@ -1168,7 +1170,7 @@ func (a *Agent) removeChannel(cid string) {
 
 const (
 	agentProtocolVersion = 3
-	maxControlFrame      = 16 * 1024 * 1024
+	maxControlFrame      = 192 * 1024 * 1024
 	maxSecretSize        = 1024 * 1024
 )
 

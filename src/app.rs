@@ -112,7 +112,8 @@ impl TerminalKind {
         match self {
             Self::PowerShell => "PowerShell",
             Self::Wsl => "WSL",
-            Self::Bash => "Bash",
+            Self::Bash if cfg!(windows) => "Bash",
+            Self::Bash => "Shell",
             Self::Cmd => "CMD",
         }
     }
@@ -145,6 +146,32 @@ impl TerminalKind {
     }
 }
 
+fn available_terminals() -> Vec<TerminalKind> {
+    let mut terminals = Vec::new();
+    if pty::posix_shell().is_some() {
+        terminals.push(TerminalKind::Bash);
+    }
+    if pty::powershell_shell().is_some() {
+        terminals.push(TerminalKind::PowerShell);
+    }
+    if pty::cmd_shell().is_some() {
+        terminals.push(TerminalKind::Cmd);
+    }
+    if pty::wsl_shell().is_some() {
+        terminals.push(TerminalKind::Wsl);
+    }
+    terminals
+}
+
+fn resolved_terminal(setting: &str, available: &[TerminalKind]) -> TerminalKind {
+    let configured = TerminalKind::from_setting(setting);
+    if available.contains(&configured) {
+        configured
+    } else {
+        available.first().copied().unwrap_or(configured)
+    }
+}
+
 #[derive(Clone)]
 struct Device {
     id: String,
@@ -169,6 +196,13 @@ struct HostKeyDialog {
     known_fingerprints: Vec<String>,
     changed: bool,
 }
+
+struct RenameDeviceDialog {
+    device: String,
+    value: String,
+    error: Option<String>,
+    focus: bool,
+}
 struct PendingRemote {
     session_id: u64,
     path: String,
@@ -179,11 +213,27 @@ struct PendingRemoteFile {
     path: String,
     rx: mpsc::Receiver<anyhow::Result<Vec<u8>>>,
 }
+struct PendingLocalFile {
+    path: PathBuf,
+    rx: mpsc::Receiver<Result<Vec<u8>, String>>,
+}
 struct PendingRemoteWrite {
     session_id: u64,
     key: PathBuf,
     saved_data: Vec<u8>,
     rx: mpsc::Receiver<anyhow::Result<()>>,
+}
+struct BinaryFileDialog {
+    remote: String,
+    local: String,
+    bytes: Vec<u8>,
+    error: Option<String>,
+}
+struct PendingBinaryDownload {
+    remote: String,
+    local: String,
+    view_hex: bool,
+    rx: mpsc::Receiver<(Result<(), String>, Vec<u8>)>,
 }
 struct PendingDeviceInfo {
     session_id: u64,
@@ -322,7 +372,7 @@ impl ConnectionType {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct SshForm {
     connection: ConnectionType,
     terminal: TerminalKind,
@@ -336,6 +386,75 @@ struct SshForm {
     save_to_vault: bool,
     label: String,
     error: Option<String>,
+}
+
+fn auth_mode(auth: &SshAuth) -> AuthMode {
+    match auth {
+        SshAuth::Password(_) => AuthMode::Password,
+        SshAuth::KeyFile { .. } => AuthMode::Key,
+        SshAuth::Agent => AuthMode::Agent,
+    }
+}
+
+fn edited_ssh_auth(
+    mode: AuthMode,
+    password: &str,
+    key_path: &str,
+    current: &SshAuth,
+) -> Result<SshAuth, String> {
+    match mode {
+        AuthMode::Password if !password.is_empty() => {
+            Ok(SshAuth::Password(Zeroizing::new(password.to_string())))
+        }
+        AuthMode::Password => match current {
+            SshAuth::Password(password) => Ok(SshAuth::Password(password.clone())),
+            _ => Err("Enter a password for this connection".into()),
+        },
+        AuthMode::Key if key_path.is_empty() => Err("Enter a private key path".into()),
+        AuthMode::Key => {
+            let passphrase = match current {
+                SshAuth::KeyFile { path, passphrase } if path == key_path => passphrase.clone(),
+                _ => None,
+            };
+            Ok(SshAuth::KeyFile {
+                path: key_path.into(),
+                passphrase,
+            })
+        }
+        AuthMode::Agent => Ok(SshAuth::Agent),
+    }
+}
+
+fn edited_vault_secret(
+    mode: AuthMode,
+    password: &str,
+    key_path: &str,
+    current: VaultSecret,
+) -> Result<VaultSecret, String> {
+    match mode {
+        AuthMode::Password if !password.is_empty() => Ok(VaultSecret::Password {
+            password: password.to_string(),
+        }),
+        AuthMode::Password => match current {
+            secret @ VaultSecret::Password { .. } => Ok(secret),
+            _ => Err("Enter a password for this connection".into()),
+        },
+        AuthMode::Key if key_path.is_empty() => Err("Enter a private key path".into()),
+        AuthMode::Key => {
+            let passphrase = match &current {
+                VaultSecret::Key {
+                    key_path: current_path,
+                    passphrase,
+                } if current_path == key_path => passphrase.clone(),
+                _ => None,
+            };
+            Ok(VaultSecret::Key {
+                key_path: key_path.into(),
+                passphrase,
+            })
+        }
+        AuthMode::Agent => Ok(VaultSecret::Agent),
+    }
 }
 
 #[derive(Default)]
@@ -368,6 +487,7 @@ enum Act {
     SelectDevice(String),
     NewSession(String),
     NewTab,
+    NewTerminal(TerminalKind),
     Activate(u64),
     Close(u64),
     OpenFile(PathBuf),
@@ -375,7 +495,7 @@ enum Act {
     RootUp,
     RefreshTree,
     ToggleEditor,
-    SysInfo,
+    Info,
     OpenModal,
     CloseModal,
     OpenSettings,
@@ -389,6 +509,10 @@ enum Act {
     VaultUnlock,
     VaultOsRetry,
     VaultLock,
+    EditDevice(String),
+    RenameDevice(String),
+    ConfirmRenameDevice,
+    CancelRenameDevice,
     DeleteDevice(String),
     VaultConnect(String),
     VaultResetBegin,
@@ -398,8 +522,10 @@ enum Act {
     RemoteSetRoot(u64, String),
     RemoteUp(u64),
     RemoteRefresh(u64),
-    RemoteOpen(u64, String),
+    RemoteOpen(u64, String, i64),
     RemoteDownload(u64, String, bool),
+    BinaryDownload(bool),
+    BinaryCancel,
     RemoteUpload(u64, String, bool),
     RemoteSync(u64, String),
     TransferPickLocalFolder,
@@ -422,16 +548,22 @@ pub struct OpenTerm {
     modal: bool,
     settings_open: bool,
     settings: Settings,
+    available_terminals: Vec<TerminalKind>,
     form: SshForm,
     pending: Vec<Pending>,
     pending_remote: Vec<PendingRemote>,
     pending_remote_files: Vec<PendingRemoteFile>,
+    pending_local_files: Vec<PendingLocalFile>,
     pending_remote_writes: Vec<PendingRemoteWrite>,
     pending_device_info: Vec<PendingDeviceInfo>,
     connection_errors: HashMap<String, String>,
     transfer_dialog: Option<TransferDialog>,
     pending_transfer: Option<PendingTransfer>,
+    binary_file_dialog: Option<BinaryFileDialog>,
+    pending_binary_download: Option<PendingBinaryDownload>,
     host_key_dialog: Option<HostKeyDialog>,
+    editing_device: Option<String>,
+    rename_device: Option<RenameDeviceDialog>,
     flash: Option<(String, bool, f64)>,
     vault: Option<Vault>,
     vault_ui: VaultState,
@@ -439,9 +571,16 @@ pub struct OpenTerm {
 }
 
 impl OpenTerm {
-    pub fn new(cc: &eframe::CreationContext, settings: Settings) -> Self {
+    pub fn new(cc: &eframe::CreationContext, mut settings: Settings) -> Self {
         wake::set(cc.egui_ctx.clone());
-        let default_terminal = TerminalKind::from_setting(&settings.default_shell);
+        let available_terminals = available_terminals();
+        let default_terminal = resolved_terminal(&settings.default_shell, &available_terminals);
+        if !available_terminals.is_empty()
+            && settings.default_shell != default_terminal.setting_id()
+        {
+            settings.default_shell = default_terminal.setting_id().into();
+            let _ = settings.save();
+        }
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
         let vault = Vault::load().ok().flatten();
         let vault_ui = match &vault {
@@ -475,6 +614,7 @@ impl OpenTerm {
             modal: false,
             settings_open: false,
             settings,
+            available_terminals,
             form: SshForm {
                 port: "22".into(),
                 ..Default::default()
@@ -482,12 +622,17 @@ impl OpenTerm {
             pending: Vec::new(),
             pending_remote: Vec::new(),
             pending_remote_files: Vec::new(),
+            pending_local_files: Vec::new(),
             pending_remote_writes: Vec::new(),
             pending_device_info: Vec::new(),
             connection_errors: HashMap::new(),
             transfer_dialog: None,
             pending_transfer: None,
+            binary_file_dialog: None,
+            pending_binary_download: None,
             host_key_dialog: None,
+            editing_device: None,
+            rename_device: None,
             flash: None,
             vault,
             vault_ui,
@@ -724,8 +869,195 @@ impl OpenTerm {
         }
     }
 
+    fn begin_edit_device(&mut self, device_id: &str, ctx: &egui::Context) {
+        let Some(device) = self
+            .devices
+            .iter()
+            .find(|device| device.id == device_id)
+            .cloned()
+        else {
+            return;
+        };
+        let mut form = SshForm {
+            label: device.label.clone(),
+            focus_host: true,
+            ..Default::default()
+        };
+        match device.kind {
+            DeviceKind::Local => return,
+            DeviceKind::Ssh(cfg) => {
+                form.connection = ConnectionType::Ssh;
+                form.host = cfg.host;
+                form.port = cfg.port.to_string();
+                form.user = cfg.user;
+                form.mode = auth_mode(&cfg.auth);
+                if let SshAuth::KeyFile { path, .. } = &cfg.auth {
+                    form.key_path = path.clone();
+                }
+            }
+            DeviceKind::VaultRef(record_id) => {
+                let Some(vault) = self.vault.as_ref() else {
+                    self.say(ctx, "Vault is unavailable", true);
+                    return;
+                };
+                if !vault.is_unlocked() {
+                    self.say(ctx, "Unlock the vault before editing this connection", true);
+                    return;
+                }
+                let Some(record) = vault
+                    .records()
+                    .iter()
+                    .find(|record| record.id == record_id)
+                    .cloned()
+                else {
+                    self.say(ctx, "Saved connection no longer exists", true);
+                    return;
+                };
+                let secret = match vault.decrypt(&record_id) {
+                    Ok(secret) => secret,
+                    Err(error) => {
+                        self.say(ctx, format!("couldn't decrypt connection: {error}"), true);
+                        return;
+                    }
+                };
+                form.connection = ConnectionType::Ssh;
+                form.host = record.host;
+                form.port = record.port.to_string();
+                form.user = record.user;
+                form.save_to_vault = true;
+                match &secret {
+                    VaultSecret::Password { .. } => form.mode = AuthMode::Password,
+                    VaultSecret::Key { key_path, .. } => {
+                        form.mode = AuthMode::Key;
+                        form.key_path = key_path.clone();
+                    }
+                    VaultSecret::Agent => form.mode = AuthMode::Agent,
+                }
+            }
+            DeviceKind::Command(profile) => {
+                form.connection = profile.kind;
+                form.terminal = profile.terminal;
+                form.host = profile.host;
+                form.port = profile.port;
+                form.user = profile.user;
+            }
+        }
+        form.error = None;
+        self.form.password.zeroize();
+        self.form = form;
+        self.editing_device = Some(device_id.to_string());
+        self.rename_device = None;
+        self.modal = true;
+    }
+
+    fn save_device_edit(&mut self, device_id: &str, form: &SshForm) -> Result<(), String> {
+        let kind = self
+            .devices
+            .iter()
+            .find(|device| device.id == device_id)
+            .map(|device| device.kind.clone())
+            .ok_or_else(|| "Connection no longer exists".to_string())?;
+        let host = form.host.trim().to_string();
+        let user = form.user.trim().to_string();
+        let port_text = form.port.trim().to_string();
+        let requested_label = form.label.trim();
+
+        let label = match kind {
+            DeviceKind::Local => return Err("The local device cannot be edited".into()),
+            DeviceKind::Ssh(mut cfg) => {
+                let port = port_text.parse().unwrap_or(22);
+                cfg.auth =
+                    edited_ssh_auth(form.mode, &form.password, form.key_path.trim(), &cfg.auth)?;
+                cfg.host = host.clone();
+                cfg.port = port;
+                cfg.user = user.clone();
+                let label = if requested_label.is_empty() {
+                    format!("{user}@{host}")
+                } else {
+                    requested_label.to_string()
+                };
+                if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
+                    device.kind = DeviceKind::Ssh(cfg);
+                    device.label = label.clone();
+                }
+                label
+            }
+            DeviceKind::VaultRef(record_id) => {
+                let port = port_text.parse().unwrap_or(22);
+                let vault = self
+                    .vault
+                    .as_mut()
+                    .ok_or_else(|| "Vault is unavailable".to_string())?;
+                let current = vault
+                    .decrypt(&record_id)
+                    .map_err(|error| format!("couldn't decrypt connection: {error}"))?;
+                let secret =
+                    edited_vault_secret(form.mode, &form.password, form.key_path.trim(), current)?;
+                let label = if requested_label.is_empty() {
+                    format!("{user}@{host}")
+                } else {
+                    requested_label.to_string()
+                };
+                vault
+                    .update(&record_id, &label, &host, port, &user, &secret)
+                    .map_err(|error| format!("couldn't save connection: {error}"))?;
+                if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
+                    device.label = label.clone();
+                }
+                label
+            }
+            DeviceKind::Command(mut profile) => {
+                profile.host = host;
+                profile.port = port_text;
+                profile.user = user;
+                profile.terminal = form.terminal;
+                let fallback = command_for_profile(&profile)
+                    .map(|(_, _, label)| label)
+                    .unwrap_or_else(|_| profile.kind.label().to_string());
+                let label = if requested_label.is_empty() {
+                    fallback
+                } else {
+                    requested_label.to_string()
+                };
+                if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
+                    device.kind = DeviceKind::Command(profile);
+                    device.label = label.clone();
+                }
+                label
+            }
+        };
+        for session in self
+            .sessions
+            .iter_mut()
+            .filter(|session| session.device == device_id)
+        {
+            session.label = label.clone();
+        }
+        self.connection_errors.remove(device_id);
+        Ok(())
+    }
+
     fn say(&mut self, ctx: &egui::Context, msg: impl Into<String>, err: bool) {
         self.flash = Some((msg.into(), err, ctx.input(|i| i.time) + 4.0));
+    }
+
+    fn large_file_notice(&mut self, ctx: &egui::Context) {
+        self.flash = Some((
+            crate::editor::LARGE_FILE_NOTICE.into(),
+            false,
+            ctx.input(|i| i.time) + 10.0,
+        ));
+    }
+
+    fn spawn_local_file(&mut self, path: PathBuf) {
+        let (tx, rx) = mpsc::channel();
+        let request_path = path.clone();
+        std::thread::spawn(move || {
+            let result = std::fs::read(&request_path).map_err(|error| error.to_string());
+            let _ = tx.send(result);
+            wake::poke();
+        });
+        self.pending_local_files.push(PendingLocalFile { path, rx });
     }
 
     fn spawn_remote_load(&mut self, session_id: u64, path: String, sftp: SftpHandle) {
@@ -899,6 +1231,25 @@ impl OpenTerm {
                 Ok(result) => {
                     let p = self.pending_remote_files.remove(i);
                     match result {
+                        Ok(bytes) if !crate::editor::is_text_bytes(&bytes) => {
+                            let name = p
+                                .path
+                                .trim_end_matches(['/', '\\'])
+                                .rsplit(['/', '\\'])
+                                .next()
+                                .filter(|name| !name.is_empty())
+                                .unwrap_or("download.bin")
+                                .to_string();
+                            let base = dirs::download_dir()
+                                .or_else(dirs::home_dir)
+                                .unwrap_or_default();
+                            self.binary_file_dialog = Some(BinaryFileDialog {
+                                remote: p.path,
+                                local: base.join(name).display().to_string(),
+                                bytes,
+                                error: None,
+                            });
+                        }
                         Ok(bytes) => match self.editor.open_remote(p.session_id, &p.path, bytes) {
                             Ok(()) => self.show_editor = true,
                             Err(e) => self.say(ctx, format!("can't open remote file: {e}"), true),
@@ -909,6 +1260,64 @@ impl OpenTerm {
                 Err(mpsc::TryRecvError::Empty) => i += 1,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.pending_remote_files.remove(i);
+                }
+            }
+        }
+    }
+
+    fn poll_binary_download(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_binary_download.as_ref() else {
+            return;
+        };
+        match pending.rx.try_recv() {
+            Ok((result, bytes)) => {
+                let pending = self.pending_binary_download.take().unwrap();
+                match result {
+                    Ok(()) => {
+                        let path = PathBuf::from(&pending.local);
+                        if pending.view_hex {
+                            self.editor.open_hex_bytes(&path, bytes);
+                            self.show_editor = true;
+                            self.say(ctx, "downloaded and opened hex view", false);
+                        } else {
+                            self.say(ctx, format!("downloaded {}", path.display()), false);
+                        }
+                    }
+                    Err(error) => {
+                        self.binary_file_dialog = Some(BinaryFileDialog {
+                            remote: pending.remote,
+                            local: pending.local,
+                            bytes,
+                            error: Some(error),
+                        });
+                    }
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.pending_binary_download = None;
+                self.say(ctx, "binary download worker stopped", true);
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    fn poll_local_files(&mut self, ctx: &egui::Context) {
+        let mut i = 0;
+        while i < self.pending_local_files.len() {
+            match self.pending_local_files[i].rx.try_recv() {
+                Ok(result) => {
+                    let pending = self.pending_local_files.remove(i);
+                    match result {
+                        Ok(bytes) => match self.editor.open_bytes(&pending.path, bytes) {
+                            Ok(()) => self.show_editor = true,
+                            Err(error) => self.say(ctx, format!("can't open: {error}"), true),
+                        },
+                        Err(error) => self.say(ctx, format!("can't open: {error}"), true),
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => i += 1,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending_local_files.remove(i);
                 }
             }
         }
@@ -1003,8 +1412,10 @@ impl OpenTerm {
 
     fn pump(&mut self, ctx: &egui::Context) {
         let mut failed = None;
-        let configured_fallback =
-            terminal_command(TerminalKind::from_setting(&self.settings.default_shell), "");
+        let configured_fallback = terminal_command(
+            resolved_terminal(&self.settings.default_shell, &self.available_terminals),
+            "",
+        );
         for s in &mut self.sessions {
             if s.backend.is_none() {
                 if s.device == "local" {
@@ -1080,7 +1491,10 @@ impl OpenTerm {
                     .map(|x| x.kind.clone())
                 {
                     Some(DeviceKind::Local) => {
-                        let terminal = TerminalKind::from_setting(&self.settings.default_shell);
+                        let terminal = resolved_terminal(
+                            &self.settings.default_shell,
+                            &self.available_terminals,
+                        );
                         if let Err(error) = self.open_local(terminal) {
                             self.say(ctx, error, true);
                         }
@@ -1093,6 +1507,11 @@ impl OpenTerm {
             }
             Act::NewTab => {
                 self.apply(ctx, Act::NewSession(self.selected.clone()));
+            }
+            Act::NewTerminal(terminal) => {
+                if let Err(error) = self.open_local(terminal) {
+                    self.say(ctx, error, true);
+                }
             }
             Act::Activate(id) => self.active = Some(id),
             Act::Close(id) => {
@@ -1108,10 +1527,24 @@ impl OpenTerm {
                     }
                 }
             }
-            Act::OpenFile(p) => match self.editor.open(&p) {
-                Ok(()) => self.show_editor = true,
-                Err(e) => self.say(ctx, format!("can't open: {e}"), true),
-            },
+            Act::OpenFile(p) => {
+                if self
+                    .pending_local_files
+                    .iter()
+                    .any(|pending| pending.path == p)
+                {
+                    return;
+                }
+                let is_large = std::fs::metadata(&p)
+                    .map(|metadata| metadata.len() > crate::editor::LARGE_FILE_THRESHOLD)
+                    .unwrap_or(false);
+                self.spawn_local_file(p);
+                if is_large {
+                    self.large_file_notice(ctx);
+                } else {
+                    self.say(ctx, "opening file…", false);
+                }
+            }
             Act::SetRoot(p) => self.tree = Node::root(&p),
             Act::RootUp => {
                 if let Some(parent) = self.tree.path.parent().map(|p| p.to_path_buf()) {
@@ -1120,7 +1553,7 @@ impl OpenTerm {
             }
             Act::RefreshTree => self.tree.refresh(),
             Act::ToggleEditor => self.show_editor = !self.show_editor,
-            Act::SysInfo => {
+            Act::Info => {
                 let command = self.active_session().map(|s| {
                     (
                         system_info::command(&s.platform, &s.shell),
@@ -1141,13 +1574,18 @@ impl OpenTerm {
                 }
             }
             Act::OpenModal => {
+                self.editing_device = None;
                 self.form.error = None;
                 self.form.focus_host = true;
                 self.form.save_to_vault =
                     self.vault.as_ref().is_some_and(|vault| vault.is_unlocked());
                 self.modal = true;
             }
-            Act::CloseModal => self.modal = false,
+            Act::CloseModal => {
+                self.modal = false;
+                self.editing_device = None;
+                self.form.password.zeroize();
+            }
             Act::OpenSettings => self.settings_open = true,
             Act::CloseSettings => self.settings_open = false,
             Act::SetTheme(mode) => {
@@ -1158,6 +1596,10 @@ impl OpenTerm {
                 }
             }
             Act::SetDefaultShell(terminal) => {
+                if !self.available_terminals.contains(&terminal) {
+                    self.say(ctx, format!("{} is not installed", terminal.label()), true);
+                    return;
+                }
                 self.settings.default_shell = terminal.setting_id().into();
                 if let Err(error) = self.settings.save() {
                     self.say(ctx, format!("couldn't save settings: {error}"), true);
@@ -1182,7 +1624,7 @@ impl OpenTerm {
                 }
             }
             Act::Connect => {
-                let f = &self.form;
+                let f = self.form.clone();
                 let connection = f.connection;
                 let host = f.host.trim().to_string();
                 let user = f.user.trim().to_string();
@@ -1201,6 +1643,19 @@ impl OpenTerm {
                 }
                 if connection.uses_ssh_auth() && user.is_empty() {
                     self.form.error = Some("A user is required".into());
+                    return;
+                }
+
+                if let Some(device_id) = self.editing_device.clone() {
+                    match self.save_device_edit(&device_id, &f) {
+                        Ok(()) => {
+                            self.modal = false;
+                            self.editing_device = None;
+                            self.form.password.zeroize();
+                            self.say(ctx, "Connection settings saved", false);
+                        }
+                        Err(error) => self.form.error = Some(error),
+                    }
                     return;
                 }
 
@@ -1465,6 +1920,66 @@ impl OpenTerm {
                     self.say(ctx, "Vault locked", false);
                 }
             }
+            Act::EditDevice(device_id) => self.begin_edit_device(&device_id, ctx),
+            Act::RenameDevice(device_id) => {
+                if let Some(device) = self.devices.iter().find(|device| device.id == device_id) {
+                    self.rename_device = Some(RenameDeviceDialog {
+                        device: device_id,
+                        value: device.label.clone(),
+                        error: None,
+                        focus: true,
+                    });
+                    self.modal = false;
+                    self.editing_device = None;
+                }
+            }
+            Act::ConfirmRenameDevice => {
+                let Some((device_id, value)) = self
+                    .rename_device
+                    .as_ref()
+                    .map(|dialog| (dialog.device.clone(), dialog.value.trim().to_string()))
+                else {
+                    return;
+                };
+                if value.is_empty() {
+                    if let Some(dialog) = self.rename_device.as_mut() {
+                        dialog.error = Some("Enter a name".into());
+                    }
+                    return;
+                }
+                let kind = self
+                    .devices
+                    .iter()
+                    .find(|device| device.id == device_id)
+                    .map(|device| device.kind.clone());
+                if let Some(DeviceKind::VaultRef(record_id)) = kind {
+                    let Some(vault) = self.vault.as_mut() else {
+                        if let Some(dialog) = self.rename_device.as_mut() {
+                            dialog.error = Some("Vault is unavailable".into());
+                        }
+                        return;
+                    };
+                    if let Err(error) = vault.rename(&record_id, &value) {
+                        if let Some(dialog) = self.rename_device.as_mut() {
+                            dialog.error = Some(format!("Rename failed: {error}"));
+                        }
+                        return;
+                    }
+                }
+                if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
+                    device.label = value.clone();
+                }
+                for session in self
+                    .sessions
+                    .iter_mut()
+                    .filter(|session| session.device == device_id)
+                {
+                    session.label = value.clone();
+                }
+                self.rename_device = None;
+                self.say(ctx, "Connection renamed", false);
+            }
+            Act::CancelRenameDevice => self.rename_device = None,
             Act::DeleteDevice(device_id) => {
                 if device_id == "local" {
                     return;
@@ -1631,7 +2146,7 @@ impl OpenTerm {
                     self.apply(ctx, Act::RemoteSetRoot(id, path));
                 }
             }
-            Act::RemoteOpen(id, path) => {
+            Act::RemoteOpen(id, path, size) => {
                 if self
                     .pending_remote_files
                     .iter()
@@ -1646,7 +2161,11 @@ impl OpenTerm {
                     .and_then(|s| s.backend.as_ref()?.sftp());
                 if let Some(sftp) = sftp {
                     self.spawn_remote_file(id, path, sftp);
-                    self.say(ctx, "opening remote file…", false);
+                    if size > crate::editor::LARGE_FILE_THRESHOLD as i64 {
+                        self.large_file_notice(ctx);
+                    } else {
+                        self.say(ctx, "opening remote file…", false);
+                    }
                 }
             }
             Act::RemoteDownload(id, remote, recursive) => {
@@ -1675,6 +2194,47 @@ impl OpenTerm {
                     busy: false,
                     error: None,
                 });
+            }
+            Act::BinaryDownload(view_hex) => {
+                if self.pending_binary_download.is_some() {
+                    return;
+                }
+                let Some(mut dialog) = self.binary_file_dialog.take() else {
+                    return;
+                };
+                let local = dialog.local.trim().to_string();
+                if local.is_empty() {
+                    dialog.error = Some("Choose where to save the file".into());
+                    self.binary_file_dialog = Some(dialog);
+                    return;
+                }
+                let remote = dialog.remote;
+                let bytes = dialog.bytes;
+                let write_path = PathBuf::from(&local);
+                let (tx, rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let result = (|| {
+                        if let Some(parent) = write_path
+                            .parent()
+                            .filter(|parent| !parent.as_os_str().is_empty())
+                        {
+                            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+                        }
+                        std::fs::write(&write_path, &bytes).map_err(|error| error.to_string())
+                    })();
+                    let _ = tx.send((result, bytes));
+                    wake::poke();
+                });
+                self.pending_binary_download = Some(PendingBinaryDownload {
+                    remote,
+                    local,
+                    view_hex,
+                    rx,
+                });
+                self.say(ctx, "downloading file…", false);
+            }
+            Act::BinaryCancel => {
+                self.binary_file_dialog = None;
             }
             Act::RemoteUpload(id, remote, recursive) => {
                 self.transfer_dialog = Some(TransferDialog {
@@ -1912,7 +2472,9 @@ impl eframe::App for OpenTerm {
         }
         self.poll_pending(ctx);
         self.poll_remote(ctx);
+        self.poll_local_files(ctx);
         self.poll_remote_files(ctx);
+        self.poll_binary_download(ctx);
         self.poll_remote_writes(ctx);
         self.poll_transfer(ctx);
         self.poll_device_info();
@@ -1943,21 +2505,30 @@ impl eframe::App for OpenTerm {
         }
         vault_dialog(ctx, &mut self.vault_ui, &mut acts);
         if self.settings_open && matches!(self.vault_ui, VaultState::Ready | VaultState::Idle) {
-            settings_dialog(ctx, &self.settings, &mut acts);
+            settings_dialog(ctx, &self.settings, &self.available_terminals, &mut acts);
         }
         if self.modal
             && !self.settings_open
+            && self.rename_device.is_none()
             && matches!(self.vault_ui, VaultState::Ready | VaultState::Idle)
         {
+            let editing = self.editing_device.is_some();
             ssh_modal(
                 ctx,
                 &mut self.form,
                 &mut acts,
                 self.vault.is_some() && self.vault.as_ref().unwrap().is_unlocked(),
+                editing,
             );
+        }
+        if let Some(dialog) = self.rename_device.as_mut() {
+            rename_device_dialog(ctx, dialog, &mut acts);
         }
         if let Some(dialog) = self.transfer_dialog.as_mut() {
             transfer_dialog(ctx, dialog, &mut acts);
+        }
+        if let Some(dialog) = self.binary_file_dialog.as_mut() {
+            binary_file_dialog(ctx, dialog, &mut acts);
         }
         if let Some(prompt) = self.host_key_dialog.as_ref() {
             host_key_dialog(ctx, prompt, &mut acts);
@@ -2260,22 +2831,21 @@ fn terminal_command(
             vec!["-NoLogo".into()],
         )),
         TerminalKind::Wsl => {
-            if !cfg!(windows) {
-                return Err("WSL terminals are available on Windows only".into());
-            }
+            let program = pty::wsl_shell().ok_or_else(|| "WSL is not installed".to_string())?;
             let mut args = Vec::new();
             if !wsl_distribution.is_empty() {
                 args.extend(["-d".into(), wsl_distribution.into()]);
             }
-            Ok(("wsl.exe".into(), args))
+            Ok((program, args))
         }
-        TerminalKind::Bash => Ok((pty::bash_shell(), vec!["-l".into()])),
-        TerminalKind::Cmd => {
-            if !cfg!(windows) {
-                return Err("CMD terminals are available on Windows only".into());
-            }
-            Ok((pty::cmd_shell(), Vec::new()))
-        }
+        TerminalKind::Bash => Ok((
+            pty::posix_shell().ok_or_else(|| "No POSIX shell is installed".to_string())?,
+            vec!["-l".into()],
+        )),
+        TerminalKind::Cmd => Ok((
+            pty::cmd_shell().ok_or_else(|| "CMD is not installed".to_string())?,
+            Vec::new(),
+        )),
     }
 }
 
@@ -2456,6 +3026,8 @@ fn sidebar(ctx: &egui::Context, app: &mut OpenTerm, acts: &mut Vec<Act>) {
                 let live = app.device_live(&d.id);
                 let pending = app.pending.iter().any(|p| p.device == d.id);
                 let removable = !matches!(d.kind, DeviceKind::Local);
+                let popup_id = Id::new(("device_menu", d.id.as_str()));
+                let menu_open = ui.memory(|memory| memory.is_popup_open(popup_id));
                 let resp = row(ui, 32.0, selected, |p, r, hovered| {
                     let ic = pos2(r.left() + 16.0, r.center().y);
                     let failed = app.connection_errors.contains_key(&d.id);
@@ -2471,8 +3043,8 @@ fn sidebar(ctx: &egui::Context, app: &mut OpenTerm, acts: &mut Vec<Act>) {
                         col,
                     );
                     let dc = pos2(r.right() - 14.0, r.center().y);
-                    if removable && hovered {
-                        icons::cross(p, dc, 4.0, if selected { fg() } else { fg_dim() });
+                    if removable && (hovered || menu_open) {
+                        icons::more(p, dc, if selected { fg() } else { fg_dim() });
                     } else if pending {
                         let t = p.ctx().input(|i| i.time) as f32;
                         icons::dot(
@@ -2498,29 +3070,60 @@ fn sidebar(ctx: &egui::Context, app: &mut OpenTerm, acts: &mut Vec<Act>) {
                         );
                     }
                 });
-                let delete_clicked = if removable {
-                    let delete_rect = Rect::from_center_size(
+                let menu_response = removable.then(|| {
+                    let menu_rect = Rect::from_center_size(
                         pos2(resp.rect.right() - 14.0, resp.rect.center().y),
                         vec2(26.0, 28.0),
                     );
                     ui.interact(
-                        delete_rect,
-                        Id::new(("delete_device", d.id.as_str())),
+                        menu_rect,
+                        Id::new(("device_menu_button", d.id.as_str())),
                         Sense::click(),
                     )
-                    .on_hover_text("Delete device")
-                    .clicked()
-                } else {
-                    false
-                };
-                if delete_clicked {
-                    acts.push(Act::DeleteDevice(d.id.clone()));
+                    .on_hover_text("Connection actions")
+                });
+                let menu_clicked = menu_response
+                    .as_ref()
+                    .is_some_and(|response| response.clicked());
+                if menu_clicked {
+                    ui.memory_mut(|memory| memory.toggle_popup(popup_id));
+                }
+                let mut menu_action = None;
+                if let Some(menu_response) = menu_response.as_ref() {
+                    let _ = egui::popup::popup_above_or_below_widget(
+                        ui,
+                        popup_id,
+                        menu_response,
+                        egui::AboveOrBelow::Below,
+                        egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+                        |ui| {
+                            ui.set_min_width(150.0);
+                            if ui.button("Edit connection").clicked() {
+                                menu_action = Some(Act::EditDevice(d.id.clone()));
+                            }
+                            if ui.button("Rename").clicked() {
+                                menu_action = Some(Act::RenameDevice(d.id.clone()));
+                            }
+                            if ui
+                                .add(egui::Button::new(
+                                    egui::RichText::new("Delete").color(red()),
+                                ))
+                                .clicked()
+                            {
+                                menu_action = Some(Act::DeleteDevice(d.id.clone()));
+                            }
+                        },
+                    );
+                }
+                if let Some(action) = menu_action {
+                    ui.memory_mut(|memory| memory.close_popup());
+                    acts.push(action);
                 } else if resp.double_clicked() {
                     acts.push(Act::NewSession(d.id.clone()));
-                } else if resp.clicked() {
+                } else if resp.clicked() && !menu_clicked {
                     acts.push(Act::SelectDevice(d.id.clone()));
                 }
-                if !delete_clicked {
+                if !menu_clicked {
                     if let Some(error) = app.connection_errors.get(&d.id) {
                         resp.on_hover_text(format!(
                             "Connection failed: {error}\n\nDouble-click to retry"
@@ -2782,7 +3385,7 @@ fn remote_tree_node(
                 acts.push(Act::RemoteLoad(session_id, n.path.clone()));
             }
         } else {
-            acts.push(Act::RemoteOpen(session_id, n.path.clone()));
+            acts.push(Act::RemoteOpen(session_id, n.path.clone(), n.size));
         }
     }
     if n.is_dir && n.expanded {
@@ -2854,20 +3457,64 @@ fn workspace(ctx: &egui::Context, app: &mut OpenTerm, acts: &mut Vec<Act>) {
                             pos2(x + 14.0, rect.center().y),
                             vec2(26.0, 26.0),
                         );
-                        if icon_at(
+                        let plus_response = icon_at(
                             ui,
                             plus,
                             Id::new("ot_newtab"),
-                            "new tab  (ctrl+t)",
+                            if app.selected == "local" {
+                                "choose shell  (ctrl+t uses default)"
+                            } else {
+                                "new tab  (ctrl+t)"
+                            },
                             |p, c, col| icons::plus(p, c, 4.5, col),
-                        )
-                        .clicked()
-                        {
-                            acts.push(Act::NewTab);
+                        );
+                        let popup_id = Id::new("ot_newtab_shell_menu");
+                        if plus_response.clicked() {
+                            if app.selected == "local" {
+                                ui.memory_mut(|memory| memory.toggle_popup(popup_id));
+                            } else {
+                                acts.push(Act::NewTab);
+                            }
+                        }
+                        if app.selected == "local" {
+                            let selected = resolved_terminal(
+                                &app.settings.default_shell,
+                                &app.available_terminals,
+                            );
+                            let mut picked = None;
+                            let _ = egui::popup::popup_above_or_below_widget(
+                                ui,
+                                popup_id,
+                                &plus_response,
+                                egui::AboveOrBelow::Below,
+                                egui::popup::PopupCloseBehavior::CloseOnClickOutside,
+                                |ui| {
+                                    ui.set_min_width(178.0);
+                                    if app.available_terminals.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new("No shell detected").color(red()),
+                                        );
+                                    }
+                                    for &terminal in &app.available_terminals {
+                                        let label = if terminal == selected {
+                                            format!("{}  ·  default", terminal.label())
+                                        } else {
+                                            terminal.label().to_string()
+                                        };
+                                        if ui.button(label).clicked() {
+                                            picked = Some(terminal);
+                                        }
+                                    }
+                                },
+                            );
+                            if let Some(terminal) = picked {
+                                ui.memory_mut(|memory| memory.close_popup());
+                                acts.push(Act::NewTerminal(terminal));
+                            }
                         }
                     }
 
-                    // right side: SysInfo pill + editor toggle
+                    // right side: Info pill + editor toggle
                     if show_tools {
                         let er = Rect::from_center_size(
                             pos2(rect.right() - 22.0, rect.center().y),
@@ -2890,9 +3537,9 @@ fn workspace(ctx: &egui::Context, app: &mut OpenTerm, acts: &mut Vec<Act>) {
                         {
                             acts.push(Act::ToggleEditor);
                         }
-                        let gal =
-                            ui.painter()
-                                .layout_no_wrap("SysInfo".into(), sans(11.5), fg_dim());
+                        let gal = ui
+                            .painter()
+                            .layout_no_wrap("Info".into(), sans(11.5), fg_dim());
                         let nr = Rect::from_min_size(
                             pos2(
                                 er.left() - 10.0 - gal.size().x - 38.0,
@@ -2918,7 +3565,7 @@ fn workspace(ctx: &egui::Context, app: &mut OpenTerm, acts: &mut Vec<Act>) {
                             control_color,
                         );
                         if nresp.clicked() {
-                            acts.push(Act::SysInfo);
+                            acts.push(Act::Info);
                         }
                     }
                 });
@@ -2997,7 +3644,7 @@ fn workspace(ctx: &egui::Context, app: &mut OpenTerm, acts: &mut Vec<Act>) {
                 .frame(Frame::none().fill(bg()))
                 .show_inside(ui, |ui| {
                     let area = ui.max_rect();
-                    let modal = app.modal || app.settings_open;
+                    let modal = app.modal || app.settings_open || app.binary_file_dialog.is_some();
                     let connection_error = app.connection_errors.get(&app.selected).cloned();
                     match app.active_session() {
                         Some(s) => {
@@ -3168,7 +3815,12 @@ fn tab(
 
 // ───────────────────────────── ssh modal ─────────────────────────────
 
-fn settings_dialog(ctx: &egui::Context, settings: &Settings, acts: &mut Vec<Act>) {
+fn settings_dialog(
+    ctx: &egui::Context,
+    settings: &Settings,
+    available_terminals: &[TerminalKind],
+    acts: &mut Vec<Act>,
+) {
     let screen = ctx.screen_rect();
     egui::Area::new(Id::new("ot_settings_backdrop"))
         .order(egui::Order::Middle)
@@ -3226,20 +3878,22 @@ fn settings_dialog(ctx: &egui::Context, settings: &Settings, acts: &mut Vec<Act>
                             .size(11.0)
                             .color(fg_muted()),
                     );
-                    let selected = TerminalKind::from_setting(&settings.default_shell);
+                    let selected = resolved_terminal(&settings.default_shell, available_terminals);
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
-                        for terminal in [
-                            TerminalKind::PowerShell,
-                            TerminalKind::Wsl,
-                            TerminalKind::Bash,
-                            TerminalKind::Cmd,
-                        ] {
+                        for &terminal in available_terminals {
                             if terminal_seg(ui, terminal, selected == terminal).clicked() {
                                 acts.push(Act::SetDefaultShell(terminal));
                             }
                         }
                     });
+                    if available_terminals.is_empty() {
+                        ui.label(
+                            egui::RichText::new("No supported shell was detected on PATH.")
+                                .size(10.5)
+                                .color(red()),
+                        );
+                    }
 
                     ui.add_space(14.0);
                     ui.label(
@@ -3460,7 +4114,72 @@ fn host_key_dialog(ctx: &egui::Context, prompt: &HostKeyDialog, acts: &mut Vec<A
     }
 }
 
-fn ssh_modal(ctx: &egui::Context, f: &mut SshForm, acts: &mut Vec<Act>, vault_ready: bool) {
+fn rename_device_dialog(ctx: &egui::Context, dialog: &mut RenameDeviceDialog, acts: &mut Vec<Act>) {
+    let screen = ctx.screen_rect();
+    egui::Area::new(Id::new("ot_rename_backdrop"))
+        .order(egui::Order::Middle)
+        .fixed_pos(screen.min)
+        .show(ctx, |ui| {
+            let response = ui.allocate_rect(screen, Sense::click());
+            ui.painter()
+                .rect_filled(screen, Rounding::ZERO, Color32::from_black_alpha(150));
+            if response.clicked() {
+                acts.push(Act::CancelRenameDevice);
+            }
+        });
+    egui::Area::new(Id::new("ot_rename_dialog"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, -20.0))
+        .show(ctx, |ui| {
+            Frame::none()
+                .fill(bg2())
+                .stroke(Stroke::new(1.0_f32, border_d()))
+                .rounding(Rounding::same(12.0))
+                .inner_margin(Margin::same(22.0))
+                .show(ui, |ui| {
+                    ui.set_width(360.0);
+                    ui.label(
+                        egui::RichText::new("Rename connection")
+                            .font(medium(15.0))
+                            .color(fg()),
+                    );
+                    ui.add_space(8.0);
+                    let response = field(ui, "Name", &mut dialog.value, "home server", false);
+                    if dialog.focus {
+                        response.request_focus();
+                        dialog.focus = false;
+                    }
+                    if let Some(error) = dialog.error.as_ref() {
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new(error).color(red()));
+                    }
+                    ui.add_space(14.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if primary_button(ui, "Rename").clicked() {
+                            acts.push(Act::ConfirmRenameDevice);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            acts.push(Act::CancelRenameDevice);
+                        }
+                    });
+                });
+        });
+    ctx.input(|input| {
+        if input.key_pressed(Key::Escape) {
+            acts.push(Act::CancelRenameDevice);
+        } else if input.key_pressed(Key::Enter) {
+            acts.push(Act::ConfirmRenameDevice);
+        }
+    });
+}
+
+fn ssh_modal(
+    ctx: &egui::Context,
+    f: &mut SshForm,
+    acts: &mut Vec<Act>,
+    vault_ready: bool,
+    editing: bool,
+) {
     f.port.retain(|c| c.is_ascii_digit());
     f.port.truncate(7);
     if !vault_ready || !f.connection.uses_ssh_auth() {
@@ -3493,38 +4212,55 @@ fn ssh_modal(ctx: &egui::Context, f: &mut SshForm, acts: &mut Vec<Act>, vault_re
                     ui.set_width(620.0);
                     ui.spacing_mut().item_spacing.y = 6.0;
                     ui.label(
-                        egui::RichText::new("New connection")
-                            .font(medium(15.0))
-                            .color(fg()),
+                        egui::RichText::new(if editing {
+                            "Edit connection"
+                        } else {
+                            "New connection"
+                        })
+                        .font(medium(15.0))
+                        .color(fg()),
                     );
                     ui.label(
-                        egui::RichText::new("Choose a protocol or local session type.")
-                            .color(fg_muted()),
+                        egui::RichText::new(if editing {
+                            "Update the settings used for future sessions."
+                        } else {
+                            "Choose a protocol or local session type."
+                        })
+                        .color(fg_muted()),
                     );
                     ui.add_space(8.0);
 
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = vec2(5.0, 5.0);
-                        for connection in ConnectionType::ALL {
-                            if connection_card(ui, connection, f.connection == connection).clicked()
-                            {
-                                let changed = f.connection != connection;
-                                f.connection = connection;
-                                f.port = connection.default_port().into();
-                                f.error = None;
-                                f.save_to_vault = vault_ready && connection.uses_ssh_auth();
-                                if changed
-                                    && matches!(
-                                        connection,
-                                        ConnectionType::Shell | ConnectionType::Wsl
-                                    )
+                    if editing {
+                        ui.label(
+                            egui::RichText::new(format!("Protocol · {}", f.connection.label()))
+                                .font(medium(12.0))
+                                .color(fg_dim()),
+                        );
+                    } else {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = vec2(5.0, 5.0);
+                            for connection in ConnectionType::ALL {
+                                if connection_card(ui, connection, f.connection == connection)
+                                    .clicked()
                                 {
-                                    f.host.clear();
-                                    f.user.clear();
+                                    let changed = f.connection != connection;
+                                    f.connection = connection;
+                                    f.port = connection.default_port().into();
+                                    f.error = None;
+                                    f.save_to_vault = vault_ready && connection.uses_ssh_auth();
+                                    if changed
+                                        && matches!(
+                                            connection,
+                                            ConnectionType::Shell | ConnectionType::Wsl
+                                        )
+                                    {
+                                        f.host.clear();
+                                        f.user.clear();
+                                    }
                                 }
                             }
-                        }
-                    });
+                        });
+                    }
                     ui.add_space(10.0);
 
                     if f.connection == ConnectionType::Shell {
@@ -3677,24 +4413,30 @@ fn ssh_modal(ctx: &egui::Context, f: &mut SshForm, acts: &mut Vec<Act>, vault_re
                                 );
                             }
                         }
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            ui.add_enabled_ui(vault_ready, |ui| {
-                                let _ = ui.add(egui::Checkbox::new(
-                                    &mut f.save_to_vault,
-                                    if vault_ready {
-                                        "Keep this machine in the vault"
-                                    } else {
-                                        "Keep this machine (unlock the vault first)"
-                                    },
-                                ));
+                        if !editing {
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.add_enabled_ui(vault_ready, |ui| {
+                                    let _ = ui.add(egui::Checkbox::new(
+                                        &mut f.save_to_vault,
+                                        if vault_ready {
+                                            "Keep this machine in the vault"
+                                        } else {
+                                            "Keep this machine (unlock the vault first)"
+                                        },
+                                    ));
+                                });
                             });
-                        });
-                        if f.save_to_vault {
+                        }
+                        if f.save_to_vault && !editing {
                             ui.add_space(2.0);
                             let _ =
                                 field(ui, "Label (optional)", &mut f.label, "home server", false);
                         }
+                    }
+                    if editing {
+                        ui.add_space(6.0);
+                        let _ = field(ui, "Name", &mut f.label, "home server", false);
                     }
                     if let Some(e) = &f.error {
                         ui.add_space(4.0);
@@ -3707,9 +4449,13 @@ fn ssh_modal(ctx: &egui::Context, f: &mut SshForm, acts: &mut Vec<Act>, vault_re
                             ui.spacing_mut().item_spacing.x = 8.0;
                             let connect = ui.add(
                                 egui::Button::new(
-                                    egui::RichText::new("Connect")
-                                        .color(bg())
-                                        .font(medium(12.5)),
+                                    egui::RichText::new(if editing {
+                                        "Save changes"
+                                    } else {
+                                        "Connect"
+                                    })
+                                    .color(bg())
+                                    .font(medium(12.5)),
                                 )
                                 .fill(fg())
                                 .stroke(Stroke::NONE)
@@ -3998,6 +4744,54 @@ fn transfer_dialog(ctx: &egui::Context, dialog: &mut TransferDialog, acts: &mut 
         });
     if ctx.input(|input| input.key_pressed(Key::Escape)) && !dialog.busy {
         acts.push(Act::TransferClose);
+    }
+}
+
+fn binary_file_dialog(ctx: &egui::Context, dialog: &mut BinaryFileDialog, acts: &mut Vec<Act>) {
+    egui::Window::new("This file isn't text")
+        .id(Id::new("ot_binary_file_dialog"))
+        .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, -10.0))
+        .collapsible(false)
+        .resizable(false)
+        .default_width(540.0)
+        .show(ctx, |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "OpenTerm can't display this file as text. You can download it, cancel, or download it and inspect the bytes as hex.",
+                )
+                .color(fg_muted()),
+            );
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new(&dialog.remote).font(mono(11.0)).color(fg()));
+            ui.add_space(6.0);
+            field(
+                ui,
+                "Save as local file",
+                &mut dialog.local,
+                "Local destination",
+                false,
+            );
+            if let Some(error) = &dialog.error {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(error).color(red()));
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("Cancel").clicked() {
+                    acts.push(Act::BinaryCancel);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Download and view as hex").clicked() {
+                        acts.push(Act::BinaryDownload(true));
+                    }
+                    if ui.button("Download").clicked() {
+                        acts.push(Act::BinaryDownload(false));
+                    }
+                });
+            });
+        });
+    if ctx.input(|input| input.key_pressed(Key::Escape)) {
+        acts.push(Act::BinaryCancel);
     }
 }
 
