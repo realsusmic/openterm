@@ -88,6 +88,17 @@ openterm/
 
 optional: `upx` for the `small` build profile.
 
+## Windows downloads
+
+Choose the regular or portable package for OpenTerm 0.1.0 on Windows x64.
+
+- [Regular](releases/openterm-v0.1.0-windows-x64.zip)
+- [Portable](releases/openterm-v0.1.0-windows-x64-portable.zip)
+
+Extract the whole ZIP and run `openterm.exe`. Keep `otm-agent.exe` beside it
+for SSH and SFTP. The portable package also keeps its settings in the adjacent
+`openterm.ini`.
+
 ## build
 
 ### Windows
