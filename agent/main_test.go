@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vmihailenco/msgpack/v5"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 )
@@ -73,6 +75,36 @@ func TestSecretFrameStaysOutOfJSONAndUsesWipeableBytes(t *testing.T) {
 	message.Auth.clear()
 	if message.Auth.Password != nil {
 		t.Fatal("password bytes were not released after clearing")
+	}
+}
+
+func TestEditorPayloadUsesMessagePackFrameOutsideJSON(t *testing.T) {
+	if maxEditorFileSize <= 200*1024*1024 {
+		t.Fatal("editor path must accept a 200 MiB file")
+	}
+	data := []byte{0, 1, 2, 0xfe, 0xff}
+	payload, err := msgpack.Marshal(editorPayload{Data: data})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := []byte{0x81, 0xa4, 'd', 'a', 't', 'a', 0xc4, 0x05, 0x00, 0x01, 0x02, 0xfe, 0xff}
+	if !bytes.Equal(payload, expected) {
+		t.Fatalf("unexpected cross-language MessagePack shape: %x", payload)
+	}
+	jsonFrame := []byte(fmt.Sprintf(
+		`{"op":"sftp_write","payload_format":"msgpack","payload_len":%d}`+"\n",
+		len(payload),
+	))
+	if bytes.Contains(jsonFrame, data) || bytes.Contains(jsonFrame, []byte("base64")) {
+		t.Fatal("editor bytes leaked into the JSON control frame")
+	}
+	wire := append(append(append([]byte{}, jsonFrame...), payload...), '\n')
+	message, err := readControlMessage(bufio.NewReader(bytes.NewReader(wire)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(message.EditorData, data) {
+		t.Fatalf("MessagePack payload changed: %x", message.EditorData)
 	}
 }
 

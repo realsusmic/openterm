@@ -14,6 +14,7 @@ use crate::{
     vault::{self, Mode as VaultMode, Secret as VaultSecret, UnlockError, Vault},
     wake,
 };
+use anyhow::{anyhow, Context};
 use egui::{
     pos2,
     text::{LayoutJob, TextFormat, TextWrapping},
@@ -25,6 +26,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{mpsc, Arc};
 use zeroize::{Zeroize, Zeroizing};
+
+type AppResult<T> = anyhow::Result<T>;
+
+mod commands;
+mod file_picker;
+use commands::*;
+use file_picker::*;
 
 // ───────────────────────────── model ─────────────────────────────
 
@@ -183,7 +191,7 @@ struct Pending {
     device: String,
     label: String,
     cfg: SshConfig,
-    rx: mpsc::Receiver<anyhow::Result<SshSession>>,
+    rx: mpsc::Receiver<AppResult<SshSession>>,
 }
 
 struct HostKeyDialog {
@@ -206,22 +214,22 @@ struct RenameDeviceDialog {
 struct PendingRemote {
     session_id: u64,
     path: String,
-    rx: mpsc::Receiver<anyhow::Result<crate::agent::DirectoryListing>>,
+    rx: mpsc::Receiver<AppResult<crate::agent::DirectoryListing>>,
 }
 struct PendingRemoteFile {
     session_id: u64,
     path: String,
-    rx: mpsc::Receiver<anyhow::Result<Vec<u8>>>,
+    rx: mpsc::Receiver<AppResult<Vec<u8>>>,
 }
 struct PendingLocalFile {
     path: PathBuf,
-    rx: mpsc::Receiver<Result<Vec<u8>, String>>,
+    rx: mpsc::Receiver<AppResult<Vec<u8>>>,
 }
 struct PendingRemoteWrite {
     session_id: u64,
     key: PathBuf,
     saved_data: Vec<u8>,
-    rx: mpsc::Receiver<anyhow::Result<()>>,
+    rx: mpsc::Receiver<AppResult<()>>,
 }
 struct BinaryFileDialog {
     remote: String,
@@ -233,11 +241,11 @@ struct PendingBinaryDownload {
     remote: String,
     local: String,
     view_hex: bool,
-    rx: mpsc::Receiver<(Result<(), String>, Vec<u8>)>,
+    rx: mpsc::Receiver<(AppResult<()>, Vec<u8>)>,
 }
 struct PendingDeviceInfo {
     session_id: u64,
-    rx: mpsc::Receiver<anyhow::Result<crate::agent::DeviceInfo>>,
+    rx: mpsc::Receiver<AppResult<crate::agent::DeviceInfo>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -283,7 +291,7 @@ enum TransferResult {
 
 struct PendingTransfer {
     session_id: u64,
-    rx: mpsc::Receiver<anyhow::Result<TransferResult>>,
+    rx: mpsc::Receiver<AppResult<TransferResult>>,
 }
 
 #[derive(Default, PartialEq, Clone, Copy)]
@@ -401,16 +409,16 @@ fn edited_ssh_auth(
     password: &str,
     key_path: &str,
     current: &SshAuth,
-) -> Result<SshAuth, String> {
+) -> AppResult<SshAuth> {
     match mode {
         AuthMode::Password if !password.is_empty() => {
             Ok(SshAuth::Password(Zeroizing::new(password.to_string())))
         }
         AuthMode::Password => match current {
             SshAuth::Password(password) => Ok(SshAuth::Password(password.clone())),
-            _ => Err("Enter a password for this connection".into()),
+            _ => Err(anyhow!("Enter a password for this connection")),
         },
-        AuthMode::Key if key_path.is_empty() => Err("Enter a private key path".into()),
+        AuthMode::Key if key_path.is_empty() => Err(anyhow!("Enter a private key path")),
         AuthMode::Key => {
             let passphrase = match current {
                 SshAuth::KeyFile { path, passphrase } if path == key_path => passphrase.clone(),
@@ -430,16 +438,16 @@ fn edited_vault_secret(
     password: &str,
     key_path: &str,
     current: VaultSecret,
-) -> Result<VaultSecret, String> {
+) -> AppResult<VaultSecret> {
     match mode {
         AuthMode::Password if !password.is_empty() => Ok(VaultSecret::Password {
             password: password.to_string(),
         }),
         AuthMode::Password => match current {
             secret @ VaultSecret::Password { .. } => Ok(secret),
-            _ => Err("Enter a password for this connection".into()),
+            _ => Err(anyhow!("Enter a password for this connection")),
         },
-        AuthMode::Key if key_path.is_empty() => Err("Enter a private key path".into()),
+        AuthMode::Key if key_path.is_empty() => Err(anyhow!("Enter a private key path")),
         AuthMode::Key => {
             let passphrase = match &current {
                 VaultSecret::Key {
@@ -663,7 +671,7 @@ impl OpenTerm {
             }
         }
         if let Err(error) = app.open_local(default_terminal) {
-            app.flash = Some((error, true, cc.egui_ctx.input(|i| i.time) + 6.0));
+            app.flash = Some((error.to_string(), true, cc.egui_ctx.input(|i| i.time) + 6.0));
         }
         app
     }
@@ -690,7 +698,7 @@ impl OpenTerm {
         }
     }
 
-    fn open_local(&mut self, terminal: TerminalKind) -> Result<(), String> {
+    fn open_local(&mut self, terminal: TerminalKind) -> AppResult<()> {
         let profile = CommandProfile {
             kind: ConnectionType::Shell,
             terminal,
@@ -812,7 +820,7 @@ impl OpenTerm {
         let (program, args, label) = match command_for_profile(&profile) {
             Ok(command) => command,
             Err(error) => {
-                self.say(ctx, error, true);
+                self.say(ctx, error.to_string(), true);
                 return;
             }
         };
@@ -950,20 +958,20 @@ impl OpenTerm {
         self.modal = true;
     }
 
-    fn save_device_edit(&mut self, device_id: &str, form: &SshForm) -> Result<(), String> {
+    fn save_device_edit(&mut self, device_id: &str, form: &SshForm) -> AppResult<()> {
         let kind = self
             .devices
             .iter()
             .find(|device| device.id == device_id)
             .map(|device| device.kind.clone())
-            .ok_or_else(|| "Connection no longer exists".to_string())?;
+            .ok_or_else(|| anyhow!("Connection no longer exists"))?;
         let host = form.host.trim().to_string();
         let user = form.user.trim().to_string();
         let port_text = form.port.trim().to_string();
         let requested_label = form.label.trim();
 
         let label = match kind {
-            DeviceKind::Local => return Err("The local device cannot be edited".into()),
+            DeviceKind::Local => return Err(anyhow!("The local device cannot be edited")),
             DeviceKind::Ssh(mut cfg) => {
                 let port = port_text.parse().unwrap_or(22);
                 cfg.auth =
@@ -987,10 +995,10 @@ impl OpenTerm {
                 let vault = self
                     .vault
                     .as_mut()
-                    .ok_or_else(|| "Vault is unavailable".to_string())?;
+                    .ok_or_else(|| anyhow!("Vault is unavailable"))?;
                 let current = vault
                     .decrypt(&record_id)
-                    .map_err(|error| format!("couldn't decrypt connection: {error}"))?;
+                    .context("couldn't decrypt connection")?;
                 let secret =
                     edited_vault_secret(form.mode, &form.password, form.key_path.trim(), current)?;
                 let label = if requested_label.is_empty() {
@@ -1000,7 +1008,7 @@ impl OpenTerm {
                 };
                 vault
                     .update(&record_id, &label, &host, port, &user, &secret)
-                    .map_err(|error| format!("couldn't save connection: {error}"))?;
+                    .context("couldn't save connection")?;
                 if let Some(device) = self.devices.iter_mut().find(|d| d.id == device_id) {
                     device.label = label.clone();
                 }
@@ -1053,7 +1061,8 @@ impl OpenTerm {
         let (tx, rx) = mpsc::channel();
         let request_path = path.clone();
         std::thread::spawn(move || {
-            let result = std::fs::read(&request_path).map_err(|error| error.to_string());
+            let result = std::fs::read(&request_path)
+                .with_context(|| format!("read {}", request_path.display()));
             let _ = tx.send(result);
             wake::poke();
         });
@@ -1091,14 +1100,14 @@ impl OpenTerm {
     fn spawn_remote_write(
         &mut self,
         save: crate::editor::RemoteSave,
-    ) -> Result<(), (crate::editor::RemoteSave, String)> {
+    ) -> std::result::Result<(), (crate::editor::RemoteSave, anyhow::Error)> {
         let Some(sftp) = self
             .sessions
             .iter()
             .find(|session| session.id == save.session_id)
             .and_then(|session| session.backend.as_ref()?.sftp())
         else {
-            return Err((save, "SSH session is no longer available".into()));
+            return Err((save, anyhow!("SSH session is no longer available")));
         };
         let crate::editor::RemoteSave {
             key,
@@ -1288,7 +1297,7 @@ impl OpenTerm {
                             remote: pending.remote,
                             local: pending.local,
                             bytes,
-                            error: Some(error),
+                            error: Some(error.to_string()),
                         });
                     }
                 }
@@ -1415,7 +1424,8 @@ impl OpenTerm {
         let configured_fallback = terminal_command(
             resolved_terminal(&self.settings.default_shell, &self.available_terminals),
             "",
-        );
+        )
+        .map_err(|error| error.to_string());
         for s in &mut self.sessions {
             if s.backend.is_none() {
                 if s.device == "local" {
@@ -1496,7 +1506,7 @@ impl OpenTerm {
                             &self.available_terminals,
                         );
                         if let Err(error) = self.open_local(terminal) {
-                            self.say(ctx, error, true);
+                            self.say(ctx, error.to_string(), true);
                         }
                     }
                     Some(DeviceKind::Ssh(cfg)) => self.open_ssh(cfg, ctx),
@@ -1510,7 +1520,7 @@ impl OpenTerm {
             }
             Act::NewTerminal(terminal) => {
                 if let Err(error) = self.open_local(terminal) {
-                    self.say(ctx, error, true);
+                    self.say(ctx, error.to_string(), true);
                 }
             }
             Act::Activate(id) => self.active = Some(id),
@@ -1654,7 +1664,7 @@ impl OpenTerm {
                             self.form.password.zeroize();
                             self.say(ctx, "Connection settings saved", false);
                         }
-                        Err(error) => self.form.error = Some(error),
+                        Err(error) => self.form.error = Some(error.to_string()),
                     }
                     return;
                 }
@@ -1687,7 +1697,7 @@ impl OpenTerm {
                 ) {
                     match launch_external(&profile) {
                         Ok(()) => self.modal = false,
-                        Err(error) => self.form.error = Some(error),
+                        Err(error) => self.form.error = Some(error.to_string()),
                     }
                     return;
                 }
@@ -2218,9 +2228,12 @@ impl OpenTerm {
                             .parent()
                             .filter(|parent| !parent.as_os_str().is_empty())
                         {
-                            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+                            std::fs::create_dir_all(parent).with_context(|| {
+                                format!("create destination folder {}", parent.display())
+                            })?;
                         }
-                        std::fs::write(&write_path, &bytes).map_err(|error| error.to_string())
+                        std::fs::write(&write_path, &bytes)
+                            .with_context(|| format!("write {}", write_path.display()))
                     })();
                     let _ = tx.send((result, bytes));
                     wake::poke();
@@ -2289,7 +2302,7 @@ impl OpenTerm {
                     Ok(None) => {}
                     Err(error) => {
                         if let Some(dialog) = self.transfer_dialog.as_mut() {
-                            dialog.error = Some(error);
+                            dialog.error = Some(error.to_string());
                         }
                     }
                 }
@@ -2497,7 +2510,7 @@ impl eframe::App for OpenTerm {
             } else if let Err((save, error)) = self.spawn_remote_write(save) {
                 if let Some((message, is_error)) =
                     self.editor
-                        .finish_remote_save(&save.key, &save.data, Err(error))
+                        .finish_remote_save(&save.key, &save.data, Err(error.to_string()))
                 {
                     self.say(ctx, message, is_error);
                 }
@@ -2703,229 +2716,6 @@ fn titlebar(ctx: &egui::Context, app: &mut OpenTerm, acts: &mut Vec<Act>) {
 fn toggle_max(ctx: &egui::Context, maximized: &mut bool) {
     *maximized = !*maximized;
     ctx.send_viewport_cmd(ViewportCommand::Maximized(*maximized));
-}
-
-fn platform_label(platform: &str) -> &str {
-    let lower = platform.to_ascii_lowercase();
-    if lower.contains("windows") || lower.contains("mingw") || lower.contains("cygwin") {
-        "Windows"
-    } else if lower.contains("darwin") || lower.contains("macos") || lower.contains("mac os") {
-        "macOS"
-    } else if lower.contains("linux") {
-        "Linux"
-    } else if platform.trim().is_empty() {
-        "Unknown"
-    } else {
-        platform
-    }
-}
-
-fn os_unlock_error(error: &UnlockError) -> String {
-    match error {
-        UnlockError::BadPassword => {
-            "The key in the OS keystore does not match this vault. No master password can unlock an OS-sign-in vault."
-                .into()
-        }
-        UnlockError::NeedPassword => {
-            "This vault was marked for OS sign-in but requested a password.".into()
-        }
-        UnlockError::Other(error) => format!("OS keystore: {error}"),
-    }
-}
-
-fn command_for_profile(profile: &CommandProfile) -> Result<(String, Vec<String>, String), String> {
-    let host = profile.host.trim();
-    let port = profile.port.trim();
-    let user_host = if profile.user.trim().is_empty() {
-        host.to_string()
-    } else {
-        format!("{}@{host}", profile.user.trim())
-    };
-    let mut label = if host.is_empty() {
-        profile.kind.label().to_string()
-    } else {
-        format!("{} · {host}", profile.kind.label())
-    };
-    let command = match profile.kind {
-        ConnectionType::Telnet => (
-            "telnet".into(),
-            [host, port]
-                .into_iter()
-                .filter(|part| !part.is_empty())
-                .map(str::to_string)
-                .collect(),
-        ),
-        ConnectionType::Rsh => {
-            let mut args = vec![host.to_string()];
-            if !profile.user.trim().is_empty() {
-                args.extend(["-l".into(), profile.user.trim().into()]);
-            }
-            ("rsh".into(), args)
-        }
-        ConnectionType::Ftp => ("ftp".into(), vec![host.into()]),
-        ConnectionType::Mosh => {
-            let mut args = Vec::new();
-            if !port.is_empty() && port != "22" {
-                args.extend(["--ssh".into(), format!("ssh -p {port}")]);
-            }
-            args.push(user_host);
-            ("mosh".into(), args)
-        }
-        ConnectionType::AwsS3 => {
-            let target = if host.is_empty() {
-                "s3://".to_string()
-            } else if host.starts_with("s3://") {
-                host.to_string()
-            } else {
-                format!("s3://{host}")
-            };
-            let mut args = vec!["s3".into(), "ls".into(), target];
-            if !profile.user.trim().is_empty() {
-                args.extend(["--profile".into(), profile.user.trim().into()]);
-            }
-            ("aws".into(), args)
-        }
-        ConnectionType::Wsl => terminal_command(TerminalKind::Wsl, host)?,
-        ConnectionType::Serial => {
-            if cfg!(windows) {
-                (
-                    "plink.exe".into(),
-                    vec![
-                        "-serial".into(),
-                        host.into(),
-                        "-sercfg".into(),
-                        format!("{},8,n,1,N", if port.is_empty() { "115200" } else { port }),
-                    ],
-                )
-            } else {
-                (
-                    "screen".into(),
-                    vec![
-                        host.into(),
-                        if port.is_empty() { "115200" } else { port }.into(),
-                    ],
-                )
-            }
-        }
-        ConnectionType::Shell => {
-            label = profile.terminal.label().into();
-            terminal_command(profile.terminal, host)?
-        }
-        _ => {
-            return Err(format!(
-                "{} opens outside the terminal",
-                profile.kind.label()
-            ))
-        }
-    };
-    Ok((command.0, command.1, label))
-}
-
-fn terminal_command(
-    kind: TerminalKind,
-    wsl_distribution: &str,
-) -> Result<(String, Vec<String>), String> {
-    match kind {
-        TerminalKind::PowerShell => Ok((
-            pty::powershell_shell().ok_or_else(|| "PowerShell is not installed".to_string())?,
-            vec!["-NoLogo".into()],
-        )),
-        TerminalKind::Wsl => {
-            let program = pty::wsl_shell().ok_or_else(|| "WSL is not installed".to_string())?;
-            let mut args = Vec::new();
-            if !wsl_distribution.is_empty() {
-                args.extend(["-d".into(), wsl_distribution.into()]);
-            }
-            Ok((program, args))
-        }
-        TerminalKind::Bash => Ok((
-            pty::posix_shell().ok_or_else(|| "No POSIX shell is installed".to_string())?,
-            vec!["-l".into()],
-        )),
-        TerminalKind::Cmd => Ok((
-            pty::cmd_shell().ok_or_else(|| "CMD is not installed".to_string())?,
-            Vec::new(),
-        )),
-    }
-}
-
-fn profile_shell(profile: &CommandProfile) -> &str {
-    match profile.kind {
-        ConnectionType::Shell => profile.terminal.shell_name(),
-        ConnectionType::Wsl => "bash",
-        _ => "unknown",
-    }
-}
-
-fn profile_platform(profile: &CommandProfile) -> &str {
-    match profile.kind {
-        ConnectionType::Wsl => "linux",
-        ConnectionType::Shell if profile.terminal == TerminalKind::Wsl => "linux",
-        ConnectionType::Shell if profile.terminal == TerminalKind::Bash && cfg!(windows) => "linux",
-        _ => std::env::consts::OS,
-    }
-}
-
-fn launch_external(profile: &CommandProfile) -> Result<(), String> {
-    use std::process::Command;
-
-    let host = profile.host.trim();
-    let port = profile.port.trim();
-    let (program, args): (String, Vec<String>) = match profile.kind {
-        ConnectionType::Browser => {
-            let url = if host.contains("://") {
-                host.to_string()
-            } else {
-                format!("https://{host}")
-            };
-            if cfg!(windows) {
-                ("explorer.exe".into(), vec![url])
-            } else if cfg!(target_os = "macos") {
-                ("open".into(), vec![url])
-            } else {
-                ("xdg-open".into(), vec![url])
-            }
-        }
-        ConnectionType::Rdp => {
-            let target = if port.is_empty() || port == "3389" {
-                host.to_string()
-            } else {
-                format!("{host}:{port}")
-            };
-            if cfg!(windows) {
-                ("mstsc.exe".into(), vec![format!("/v:{target}")])
-            } else {
-                ("xfreerdp".into(), vec![format!("/v:{target}")])
-            }
-        }
-        ConnectionType::Vnc => {
-            let target = if port.is_empty() {
-                host.to_string()
-            } else {
-                format!("{host}:{port}")
-            };
-            if cfg!(target_os = "macos") {
-                ("open".into(), vec![format!("vnc://{target}")])
-            } else {
-                ("vncviewer".into(), vec![target])
-            }
-        }
-        ConnectionType::Xdmcp => (
-            "Xephyr".into(),
-            vec!["-query".into(), host.into(), ":1".into()],
-        ),
-        _ => {
-            return Err(format!(
-                "{} is not an external connection",
-                profile.kind.label()
-            ))
-        }
-    };
-    Command::new(&program)
-        .args(&args)
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| format!("couldn't launch {program}: {error}"))
 }
 
 fn statusbar(ctx: &egui::Context, app: &OpenTerm) {
@@ -4490,88 +4280,6 @@ fn ssh_modal(
     });
 }
 
-fn sync_root_too_broad(value: &str) -> bool {
-    let value = value.trim();
-    if value.is_empty() {
-        return false;
-    }
-    let supplied = Path::new(value);
-    let normalized = std::fs::canonicalize(supplied).unwrap_or_else(|_| supplied.to_path_buf());
-    if normalized.parent().is_none() {
-        return true;
-    }
-    dirs::home_dir()
-        .map(|home| std::fs::canonicalize(&home).unwrap_or(home) == normalized)
-        .unwrap_or(false)
-}
-
-#[cfg(target_os = "windows")]
-fn pick_local_folder(start: &str) -> Result<Option<String>, String> {
-    use std::os::windows::process::CommandExt;
-
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    const SCRIPT: &str = r#"Add-Type -AssemblyName System.Windows.Forms; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); $d=New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description='Select local project folder'; if(Test-Path -LiteralPath $env:OPENTERM_PICKER_START){$d.SelectedPath=$env:OPENTERM_PICKER_START}; if($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){[Console]::Out.Write($d.SelectedPath)}"#;
-    let output = Command::new("powershell.exe")
-        .args(["-NoLogo", "-NoProfile", "-STA", "-Command", SCRIPT])
-        .env("OPENTERM_PICKER_START", start)
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|error| format!("couldn't open the folder picker: {error}"))?;
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if message.is_empty() {
-            "the folder picker failed".into()
-        } else {
-            message
-        });
-    }
-    let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok((!selected.is_empty()).then_some(selected))
-}
-
-#[cfg(target_os = "macos")]
-fn pick_local_folder(_start: &str) -> Result<Option<String>, String> {
-    let output = Command::new("osascript")
-        .args([
-            "-e",
-            "POSIX path of (choose folder with prompt \"Select local project folder\")",
-        ])
-        .output()
-        .map_err(|error| format!("couldn't open the folder picker: {error}"))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let selected = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .trim_end_matches('/')
-        .to_string();
-    Ok((!selected.is_empty()).then_some(selected))
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn pick_local_folder(start: &str) -> Result<Option<String>, String> {
-    let zenity_start = format!("--filename={}/", start.trim_end_matches('/'));
-    let attempts = [
-        (
-            "zenity",
-            vec!["--file-selection", "--directory", &zenity_start],
-        ),
-        ("kdialog", vec!["--getexistingdirectory", start]),
-    ];
-    for (program, args) in attempts {
-        match Command::new(program).args(args).output() {
-            Ok(output) if output.status.success() => {
-                let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                return Ok((!selected.is_empty()).then_some(selected));
-            }
-            Ok(_) => return Ok(None),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(format!("couldn't open the folder picker: {error}")),
-        }
-    }
-    Err("No folder picker is installed (tried zenity and kdialog). You can still enter the path manually.".into())
-}
-
 fn transfer_dialog(ctx: &egui::Context, dialog: &mut TransferDialog, acts: &mut Vec<Act>) {
     let title = match dialog.mode {
         TransferMode::DownloadFile => "Download remote file",
@@ -5506,5 +5214,19 @@ fn window_edges(ctx: &egui::Context) {
         if ctx.input(|i| i.pointer.primary_pressed()) {
             ctx.send_viewport_cmd(ViewportCommand::BeginResize(dir));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::platform_label;
+
+    #[test]
+    fn unknown_platforms_use_the_unknown_status_label() {
+        assert_eq!(platform_label(""), "Unknown");
+        assert_eq!(platform_label("mystery-os"), "Unknown");
+        assert_eq!(platform_label("Linux"), "Linux");
+        assert_eq!(platform_label("Windows_NT"), "Windows");
+        assert_eq!(platform_label("Darwin"), "macOS");
     }
 }

@@ -27,6 +27,8 @@ portable-pty = "0.8"
 # plumbing
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_bytes = "0.11"
+rmp-serde = "1.3"
 parking_lot = "0.12"
 anyhow = "1"
 log = "0.4"

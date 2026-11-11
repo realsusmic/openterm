@@ -1,5 +1,7 @@
 //! icons — tiny vector icons painted directly, so no glyph ever renders as □.
-use egui::{pos2, vec2, Color32, Painter, Pos2, Rect, Rounding, Shape, Stroke};
+use egui::{
+    epaint::CubicBezierShape, pos2, vec2, Color32, Painter, Pos2, Rect, Rounding, Shape, Stroke,
+};
 
 fn s(c: Color32) -> Stroke {
     Stroke::new(1.3_f32, c)
@@ -345,8 +347,51 @@ pub fn platform(p: &Painter, c: Pos2, name: &str, col: Color32) {
     } else if name.contains("linux") {
         linux(p, c, col);
     } else {
-        server(p, c, col);
+        unknown(p, c, col);
     }
+}
+
+/// Question-mark icon scaled directly from the supplied 128×128 SVG path.
+pub fn unknown(p: &Painter, c: Pos2, col: Color32) {
+    let point = |x: f32, y: f32| c + vec2((x - 64.0) * 0.11, (y - 64.0) * 0.11);
+    let stroke = Stroke::new(1.32_f32, col);
+    for points in [
+        [
+            point(39.0, 43.0),
+            point(39.0, 28.0),
+            point(50.0, 18.0),
+            point(65.0, 18.0),
+        ],
+        [
+            point(65.0, 18.0),
+            point(80.0, 18.0),
+            point(91.0, 28.0),
+            point(91.0, 42.0),
+        ],
+        [
+            point(91.0, 42.0),
+            point(91.0, 54.0),
+            point(84.0, 60.0),
+            point(73.0, 67.0),
+        ],
+        [
+            point(73.0, 67.0),
+            point(65.0, 72.0),
+            point(64.0, 76.0),
+            point(64.0, 84.0),
+        ],
+    ] {
+        p.add(Shape::CubicBezier(CubicBezierShape::from_points_stroke(
+            points,
+            false,
+            Color32::TRANSPARENT,
+            stroke,
+        )));
+    }
+    // Match the SVG's rounded stroke caps and lower dot.
+    p.circle_filled(point(39.0, 43.0), 0.66, col);
+    p.circle_filled(point(64.0, 84.0), 0.66, col);
+    p.circle_filled(point(64.0, 106.0), 0.77, col);
 }
 
 fn windows(p: &Painter, c: Pos2, col: Color32) {

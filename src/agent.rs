@@ -1,13 +1,14 @@
 //! agent — control-side client for `otm-agent` (go sidecar).
 //!
 //! Spawns the agent binary as a child process, communicates over its stdin/stdout
-//! with newline-delimited JSON. Each session/channel is identified by string ids.
+//! with newline-delimited JSON control messages plus bounded MessagePack frames
+//! for editor file payloads. Each session/channel is identified by string ids.
 
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -15,7 +16,28 @@ use std::thread;
 use std::time::{Duration, Instant};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-const AGENT_PROTOCOL_VERSION: u32 = 3;
+const AGENT_PROTOCOL_VERSION: u32 = 4;
+const MAX_EDITOR_PAYLOAD: usize = 272 * 1024 * 1024;
+
+#[derive(Serialize)]
+struct EditorPayloadRef<'a> {
+    #[serde(with = "serde_bytes")]
+    data: &'a [u8],
+}
+
+#[derive(Deserialize)]
+struct EditorPayload {
+    #[serde(with = "serde_bytes")]
+    data: Vec<u8>,
+}
+
+fn encode_editor_payload(data: &[u8]) -> Result<Vec<u8>> {
+    Ok(rmp_serde::to_vec_named(&EditorPayloadRef { data })?)
+}
+
+fn decode_editor_payload(frame: &[u8]) -> Result<Vec<u8>> {
+    Ok(rmp_serde::from_slice::<EditorPayload>(frame)?.data)
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileEntry {
@@ -103,6 +125,10 @@ pub struct AgentMsg {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret_len: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_len: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entries: Option<Vec<FileEntry>>,
@@ -114,6 +140,8 @@ pub struct AgentMsg {
     pub direction: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub changes: Option<Vec<SyncChange>>,
+    #[serde(skip)]
+    pub binary: Option<Arc<[u8]>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Zeroize, ZeroizeOnDrop)]
@@ -249,6 +277,29 @@ impl Agent {
         let rx = self.subscribe();
         message.id = Some(id.clone());
         self.send(&message)?;
+        Self::wait_for_reply(rx, &id, timeout, label)
+    }
+
+    fn request_with_editor_payload(
+        &self,
+        mut message: AgentMsg,
+        data: &[u8],
+        timeout: Duration,
+        label: &str,
+    ) -> Result<AgentMsg> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let rx = self.subscribe();
+        message.id = Some(id.clone());
+        self.send_editor_payload(message, data)?;
+        Self::wait_for_reply(rx, &id, timeout, label)
+    }
+
+    fn wait_for_reply(
+        rx: Receiver<AgentMsg>,
+        id: &str,
+        timeout: Duration,
+        label: &str,
+    ) -> Result<AgentMsg> {
         let deadline = Instant::now() + timeout;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -261,7 +312,7 @@ impl Agent {
                         .err
                         .unwrap_or_else(|| "SSH helper exited unexpectedly".into())));
                 }
-                Ok(reply) if reply.id.as_deref() == Some(id.as_str()) => {
+                Ok(reply) if reply.id.as_deref() == Some(id) => {
                     if reply.ok.unwrap_or(false) {
                         return Ok(reply);
                     }
@@ -273,6 +324,23 @@ impl Agent {
                 Err(_) => return Err(anyhow!("SSH agent stopped during {label}")),
             }
         }
+    }
+
+    fn send_editor_payload(&self, mut message: AgentMsg, data: &[u8]) -> Result<()> {
+        let payload = encode_editor_payload(data)?;
+        if payload.len() > MAX_EDITOR_PAYLOAD {
+            return Err(anyhow!("editor payload exceeds the 272 MB frame limit"));
+        }
+        message.payload_format = Some("msgpack".into());
+        message.payload_len = Some(payload.len());
+        let mut control = Zeroizing::new(serde_json::to_string(&message)?);
+        control.push('\n');
+        let mut stdin = self.stdin.lock();
+        stdin.write_all(control.as_bytes())?;
+        stdin.write_all(&payload)?;
+        stdin.write_all(b"\n")?;
+        stdin.flush()?;
+        Ok(())
     }
 
     pub fn dial(
@@ -399,10 +467,9 @@ impl Agent {
                             .err
                             .unwrap_or_else(|| "remote file read failed".into())));
                     }
-                    let data = m.data.unwrap_or_default();
-                    return B64
-                        .decode(data)
-                        .map_err(|e| anyhow!("invalid remote file data: {e}"));
+                    return m.binary.map(|data| data.as_ref().to_vec()).ok_or_else(|| {
+                        anyhow!("remote file reply did not contain MessagePack data")
+                    });
                 }
                 Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(_) => return Err(anyhow!("SSH agent stopped while reading file")),
@@ -411,14 +478,14 @@ impl Agent {
     }
 
     pub fn sftp_write(&self, session: &str, path: &str, data: &[u8]) -> Result<()> {
-        self.request(
+        self.request_with_editor_payload(
             AgentMsg {
                 op: Some("sftp_write".into()),
                 session: Some(session.into()),
                 path: Some(path.into()),
-                data: Some(B64.encode(data)),
                 ..Default::default()
             },
+            data,
             Duration::from_secs(120),
             "remote file save",
         )?;
@@ -539,12 +606,38 @@ fn capture_stderr(stderr: ChildStderr, last_stderr: Arc<Mutex<Option<String>>>) 
 }
 
 fn reader_loop(stdout: ChildStdout, tx: Sender<AgentMsg>, last_stderr: Arc<Mutex<Option<String>>>) {
-    let r = BufReader::new(stdout);
-    for line in r.lines().map_while(Result::ok) {
+    let mut reader = BufReader::new(stdout);
+    loop {
+        let mut line = String::new();
+        let Ok(read) = reader.read_line(&mut line) else {
+            break;
+        };
+        if read == 0 {
+            break;
+        }
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(m) = serde_json::from_str::<AgentMsg>(&line) {
+        if let Ok(mut m) = serde_json::from_str::<AgentMsg>(&line) {
+            if let Some(payload_len) = m.payload_len {
+                if payload_len > MAX_EDITOR_PAYLOAD
+                    || m.payload_format.as_deref() != Some("msgpack")
+                {
+                    break;
+                }
+                let mut payload = vec![0_u8; payload_len];
+                if reader.read_exact(&mut payload).is_err() {
+                    break;
+                }
+                let mut terminator = [0_u8; 1];
+                if reader.read_exact(&mut terminator).is_err() || terminator[0] != b'\n' {
+                    break;
+                }
+                let Ok(decoded) = decode_editor_payload(&payload) else {
+                    break;
+                };
+                m.binary = Some(Arc::from(decoded));
+            }
             let _ = tx.send(m);
             crate::wake::poke();
         }
@@ -564,4 +657,21 @@ fn reader_loop(stdout: ChildStdout, tx: Sender<AgentMsg>, last_stderr: Arc<Mutex
         ..Default::default()
     });
     crate::wake::poke();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_editor_payload, encode_editor_payload, MAX_EDITOR_PAYLOAD};
+
+    #[test]
+    fn editor_payload_round_trips_binary_messagepack() {
+        assert!(MAX_EDITOR_PAYLOAD > 200 * 1024 * 1024);
+        let original = [0_u8, 1, 2, 0xfe, 0xff];
+        let encoded = encode_editor_payload(&original).unwrap();
+        assert_eq!(
+            encoded,
+            [0x81, 0xa4, b'd', b'a', b't', b'a', 0xc4, 0x05, 0x00, 0x01, 0x02, 0xfe, 0xff,]
+        );
+        assert_eq!(decode_editor_payload(&encoded).unwrap(), original);
+    }
 }

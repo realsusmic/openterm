@@ -11,7 +11,8 @@
 //   <- {"chan":"cid","stream":"stdout","data":"base64..."}
 //   -> {"op":"resize","chan":"cid","cols":120,"rows":40}
 //   -> {"op":"sftp_ls","session":"sid","path":"/home"} -> {"entries":[...]}
-//   -> {"op":"sftp_read","session":"sid","path":"/home/x"} -> {"data":"base64..."}
+//   -> {"op":"sftp_read","session":"sid","path":"/home/x"}
+//   <- JSON metadata followed by a bounded MessagePack binary frame
 //   -> {"op":"device_info","session":"sid"} -> {"hostname":"...","platform":"Linux"}
 //   -> {"op":"sftp_get","session":"sid","remote":"/x","local":"/y"}
 //   -> {"op":"close","chan":"cid"}
@@ -42,6 +43,7 @@ import (
 	"time"
 
 	"github.com/pkg/sftp"
+	"github.com/vmihailenco/msgpack/v5"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
@@ -75,6 +77,8 @@ type Msg struct {
 	TrustHostKey      string          `json:"trust_host_key,omitempty"`
 	ReplaceHostKey    bool            `json:"replace_host_key,omitempty"`
 	SecretLen         int             `json:"secret_len,omitempty"`
+	PayloadFormat     string          `json:"payload_format,omitempty"`
+	PayloadLen        int             `json:"payload_len,omitempty"`
 	Protocol          int             `json:"protocol,omitempty"`
 	Entries           []FileEntry     `json:"entries,omitempty"`
 	Hostname          string          `json:"hostname,omitempty"`
@@ -82,6 +86,11 @@ type Msg struct {
 	Direction         string          `json:"direction,omitempty"`
 	Changes           []SyncChange    `json:"changes,omitempty"`
 	Raw               json.RawMessage `json:"-"`
+	EditorData        []byte          `json:"-"`
+}
+
+type editorPayload struct {
+	Data []byte `msgpack:"data"`
 }
 
 type AuthSpec struct {
@@ -159,6 +168,27 @@ func (a *Agent) send(m Msg) {
 	a.outMu.Lock()
 	defer a.outMu.Unlock()
 	_ = a.out.Encode(&m)
+}
+
+func (a *Agent) sendEditorPayload(m Msg, data []byte) {
+	payload, err := msgpack.Marshal(editorPayload{Data: data})
+	if err != nil {
+		a.send(Msg{ID: m.ID, Ok: false, Err: "encode editor payload: " + err.Error()})
+		return
+	}
+	if len(payload) > maxEditorMsgpackFrame {
+		a.send(Msg{ID: m.ID, Ok: false, Err: "editor payload exceeds the 272 MB frame limit"})
+		return
+	}
+	m.PayloadFormat = "msgpack"
+	m.PayloadLen = len(payload)
+	a.outMu.Lock()
+	defer a.outMu.Unlock()
+	if err := a.out.Encode(&m); err != nil {
+		return
+	}
+	_, _ = os.Stdout.Write(payload)
+	_, _ = os.Stdout.Write([]byte{'\n'})
 }
 
 func (a *Agent) handle(m Msg) {
@@ -629,7 +659,7 @@ func (a *Agent) sftpLs(m Msg) {
 
 // The editor switches to a cheaper rendering path above 4 MiB. Keep a much
 // higher safety ceiling here so malformed requests cannot exhaust the agent.
-const maxEditorFileSize = 128 * 1024 * 1024
+const maxEditorFileSize = 256 * 1024 * 1024
 
 func (a *Agent) sftpRead(m Msg) {
 	s := a.getSess(m.Session)
@@ -653,10 +683,10 @@ func (a *Agent) sftpRead(m Msg) {
 		return
 	}
 	if len(data) > maxEditorFileSize {
-		a.send(Msg{ID: m.ID, Ok: false, Err: "file exceeds the 128 MB safety limit"})
+		a.send(Msg{ID: m.ID, Ok: false, Err: "file exceeds the 256 MB safety limit"})
 		return
 	}
-	a.send(Msg{ID: m.ID, Ok: true, Data: base64.StdEncoding.EncodeToString(data)})
+	a.sendEditorPayload(Msg{ID: m.ID, Ok: true}, data)
 }
 
 func (a *Agent) sftpWrite(m Msg) {
@@ -665,9 +695,9 @@ func (a *Agent) sftpWrite(m Msg) {
 		a.send(Msg{ID: m.ID, Ok: false, Err: "sftp unavailable"})
 		return
 	}
-	data, err := base64.StdEncoding.DecodeString(m.Data)
-	if err != nil {
-		a.send(Msg{ID: m.ID, Ok: false, Err: "invalid file data: " + err.Error()})
+	data := m.EditorData
+	if data == nil {
+		a.send(Msg{ID: m.ID, Ok: false, Err: "missing MessagePack editor payload"})
 		return
 	}
 	tmp := fmt.Sprintf("%s.openterm-%d.tmp", m.Path, time.Now().UnixNano())
@@ -1169,9 +1199,10 @@ func (a *Agent) removeChannel(cid string) {
 }
 
 const (
-	agentProtocolVersion = 3
-	maxControlFrame      = 192 * 1024 * 1024
-	maxSecretSize        = 1024 * 1024
+	agentProtocolVersion  = 4
+	maxControlFrame       = 8 * 1024 * 1024
+	maxEditorMsgpackFrame = 272 * 1024 * 1024
+	maxSecretSize         = 1024 * 1024
 )
 
 func readControlLine(reader *bufio.Reader) ([]byte, error) {
@@ -1207,31 +1238,55 @@ func readControlMessage(reader *bufio.Reader) (Msg, error) {
 	if message.SecretLen < 0 || message.SecretLen > maxSecretSize {
 		return message, fmt.Errorf("invalid secret length %d", message.SecretLen)
 	}
-	if message.SecretLen == 0 {
-		return message, nil
+	if message.SecretLen > 0 {
+		secret := make([]byte, message.SecretLen)
+		if _, err := io.ReadFull(reader, secret); err != nil {
+			clear(secret)
+			return message, fmt.Errorf("read secret frame: %w", err)
+		}
+		terminator, err := reader.ReadByte()
+		if err != nil || terminator != '\n' {
+			clear(secret)
+			return message, fmt.Errorf("invalid secret frame terminator")
+		}
+		if message.Auth == nil {
+			clear(secret)
+			return message, fmt.Errorf("secret frame without authentication")
+		}
+		switch message.Auth.Kind {
+		case "password":
+			message.Auth.Password = secret
+		case "key":
+			message.Auth.Passphrase = secret
+		default:
+			clear(secret)
+			return message, fmt.Errorf("unexpected secret for %q authentication", message.Auth.Kind)
+		}
 	}
-	secret := make([]byte, message.SecretLen)
-	if _, err := io.ReadFull(reader, secret); err != nil {
-		clear(secret)
-		return message, fmt.Errorf("read secret frame: %w", err)
+	if message.PayloadLen < 0 || message.PayloadLen > maxEditorMsgpackFrame {
+		return message, fmt.Errorf("invalid editor payload length %d", message.PayloadLen)
 	}
-	terminator, err := reader.ReadByte()
-	if err != nil || terminator != '\n' {
-		clear(secret)
-		return message, fmt.Errorf("invalid secret frame terminator")
-	}
-	if message.Auth == nil {
-		clear(secret)
-		return message, fmt.Errorf("secret frame without authentication")
-	}
-	switch message.Auth.Kind {
-	case "password":
-		message.Auth.Password = secret
-	case "key":
-		message.Auth.Passphrase = secret
-	default:
-		clear(secret)
-		return message, fmt.Errorf("unexpected secret for %q authentication", message.Auth.Kind)
+	if message.PayloadLen > 0 {
+		if message.PayloadFormat != "msgpack" {
+			return message, fmt.Errorf("unsupported editor payload format %q", message.PayloadFormat)
+		}
+		frame := make([]byte, message.PayloadLen)
+		if _, err := io.ReadFull(reader, frame); err != nil {
+			clear(frame)
+			return message, fmt.Errorf("read editor payload: %w", err)
+		}
+		terminator, err := reader.ReadByte()
+		if err != nil || terminator != '\n' {
+			clear(frame)
+			return message, fmt.Errorf("invalid editor payload terminator")
+		}
+		var payload editorPayload
+		if err := msgpack.Unmarshal(frame, &payload); err != nil {
+			clear(frame)
+			return message, fmt.Errorf("decode editor payload: %w", err)
+		}
+		clear(frame)
+		message.EditorData = payload.Data
 	}
 	return message, nil
 }
@@ -1255,7 +1310,9 @@ func main() {
 		}
 		if err != nil {
 			a.send(Msg{Ok: false, Err: err.Error()})
-			if strings.Contains(err.Error(), "secret frame") || strings.Contains(err.Error(), "control frame") {
+			if strings.Contains(err.Error(), "secret frame") ||
+				strings.Contains(err.Error(), "control frame") ||
+				strings.Contains(err.Error(), "editor payload") {
 				break
 			}
 			continue
@@ -1266,6 +1323,7 @@ func main() {
 			defer func() { <-workers }()
 			defer requests.Done()
 			defer m.Auth.clear()
+			defer clear(m.EditorData)
 			a.handle(m)
 		}()
 	}

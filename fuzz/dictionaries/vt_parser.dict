@@ -1,0 +1,8 @@
+esc="\x1b"
+csi="\x1b["
+osc="\x1b]"
+dcs="\x1bP"
+st="\x1b\\"
+bel="\x07"
+sgr="\x1b[38:2::255:128:0m"
+osc52="\x1b]52;c;"
