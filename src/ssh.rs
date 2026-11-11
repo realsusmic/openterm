@@ -2,56 +2,40 @@
 //! Delegates all actual SSH work to the go `otm-agent` sidecar (see agent.rs).
 
 use crate::agent::{Agent, AgentMsg, AuthSpec, DeviceInfo, DirectoryListing, SyncChange};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use parking_lot::Mutex;
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Process-wide handle to the running `otm-agent` sidecar. Spawned on first use.
-static AGENT: OnceLock<Arc<Agent>> = OnceLock::new();
+static AGENT: Mutex<Option<Arc<Agent>>> = Mutex::new(None);
 
 fn agent() -> Result<Arc<Agent>> {
-    if let Some(a) = AGENT.get() {
+    let mut slot = AGENT.lock();
+    if let Some(a) = slot.as_ref().filter(|agent| agent.is_running()) {
         return Ok(a.clone());
     }
-    // search path: next to our exe, then PATH
     let exe = find_agent_binary()?;
     let a = Arc::new(Agent::spawn(&exe)?);
-    let _ = AGENT.set(a.clone());
+    *slot = Some(a.clone());
     Ok(a)
 }
 
 fn find_agent_binary() -> Result<std::path::PathBuf> {
-    // 1. same dir as the current exe
-    if let Ok(mut p) = std::env::current_exe() {
-        p.pop();
-        let name = if cfg!(windows) {
-            "otm-agent.exe"
-        } else {
-            "otm-agent"
-        };
-        let candidate = p.join(name);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-    // 2. PATH
+    let exe = std::env::current_exe().context("locate OpenTerm executable")?;
     let name = if cfg!(windows) {
         "otm-agent.exe"
     } else {
         "otm-agent"
     };
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-        }
+    let candidate = exe.with_file_name(name);
+    if candidate.is_file() {
+        Ok(candidate)
+    } else {
+        Err(anyhow!("SSH helper not found at {}", candidate.display()))
     }
-    Err(anyhow!("otm-agent binary not found next to exe or in PATH"))
 }
 
 #[derive(Clone)]
@@ -136,7 +120,6 @@ pub struct SshSession {
     pub channel_id: String,
     pub label: String,
     rx: Mutex<Receiver<AgentMsg>>,
-    out_buf: Mutex<Vec<u8>>,
 }
 
 /// Cloneable SFTP-only view of an SSH connection. It deliberately does not
@@ -262,36 +245,75 @@ impl SshSession {
             return Err(anyhow!("ssh dial failed: {err_msg}"));
         }
 
-        // open a shell channel
-        agent.exec_shell(&session_id, &channel_id, cols, rows)?;
-
-        Ok(Self {
+        let session = Self {
             agent,
             session_id,
-            channel_id: channel_id.clone(),
+            channel_id,
             label: format!("ssh · {}@{}", cfg.user, cfg.host),
             rx: Mutex::new(rx),
-            out_buf: Mutex::new(Vec::new()),
-        })
+        };
+        session.open_shell(cols, rows)?;
+        Ok(session)
     }
 
-    pub fn write(&self, data: &[u8]) {
-        let _ = self.agent.write(&self.channel_id, data);
-    }
-    pub fn resize(&self, cols: u16, rows: u16) {
-        let _ = self.agent.resize(&self.channel_id, cols, rows);
-    }
-    pub fn drain(&self) -> Vec<u8> {
+    fn open_shell(&self, cols: u16, rows: u16) -> Result<()> {
+        self.agent
+            .exec_shell(&self.session_id, &self.channel_id, cols, rows)?;
+        let deadline = Instant::now() + Duration::from_secs(15);
         let rx = self.rx.lock();
-        let mut out = self.out_buf.lock();
+        while Instant::now() < deadline {
+            let Ok(msg) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            else {
+                break;
+            };
+            if msg.op.as_deref() == Some("agent_exit") {
+                return Err(anyhow!(msg
+                    .err
+                    .unwrap_or_else(|| "SSH helper exited".into())));
+            }
+            if msg.channel.as_deref() == Some(self.channel_id.as_str()) {
+                return if msg.ok == Some(true) {
+                    Ok(())
+                } else {
+                    Err(anyhow!(msg
+                        .err
+                        .unwrap_or_else(|| "couldn't open SSH shell".into())))
+                };
+            }
+        }
+        Err(anyhow!("SSH shell did not open before the timeout"))
+    }
+
+    pub fn write(&self, data: &[u8]) -> Result<()> {
+        self.agent
+            .write(&self.channel_id, data)
+            .context("write to SSH helper")
+    }
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        self.agent
+            .resize(&self.channel_id, cols, rows)
+            .context("resize SSH shell")
+    }
+    pub fn drain(&self) -> (Vec<u8>, Option<String>) {
+        let rx = self.rx.lock();
+        let mut out = Vec::new();
+        let mut ended = None;
         while let Ok(m) = rx.try_recv() {
+            if m.op.as_deref() == Some("agent_exit") {
+                ended.get_or_insert_with(|| m.err.unwrap_or_else(|| "SSH helper exited".into()));
+                continue;
+            }
             if m.channel.as_deref() == Some(self.channel_id.as_str()) {
-                if let Some(d) = self.agent.decode_data(&m) {
+                if let Some(error) = m.err {
+                    ended.get_or_insert(error);
+                } else if m.stream.as_deref() == Some("exit") {
+                    ended.get_or_insert_with(|| "Remote shell exited".into());
+                } else if let Some(d) = self.agent.decode_data(&m) {
                     out.extend_from_slice(&d);
                 }
             }
         }
-        std::mem::take(&mut *out)
+        (out, ended)
     }
     pub fn sftp(&self) -> SftpHandle {
         SftpHandle {

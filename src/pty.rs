@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 pub struct LocalPty {
@@ -12,6 +12,35 @@ pub struct LocalPty {
     writer: Mutex<Box<dyn Write + Send>>,
     rx: Receiver<Vec<u8>>,
     killer: Option<Box<dyn ChildKiller + Send + Sync>>,
+}
+
+struct ReaderDone(Sender<Vec<u8>>);
+
+impl Drop for ReaderDone {
+    fn drop(&mut self) {
+        let message: &[u8] = if thread::panicking() {
+            b"\r\n\x1b[31m[PTY reader stopped unexpectedly]\x1b[0m\r\n"
+        } else {
+            b"\r\n\x1b[90m[process exited]\x1b[0m\r\n"
+        };
+        let _ = self.0.send(message.to_vec());
+        crate::wake::poke();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn reader_panic_still_notifies_the_terminal() {
+        let (tx, rx) = super::mpsc::channel();
+        let reader = super::thread::spawn(move || {
+            let _done = super::ReaderDone(tx);
+            panic!("test reader panic");
+        });
+        assert!(reader.join().is_err());
+        let message = rx.try_recv().unwrap();
+        assert!(String::from_utf8_lossy(&message).contains("PTY reader stopped unexpectedly"));
+    }
 }
 
 impl LocalPty {
@@ -45,20 +74,19 @@ impl LocalPty {
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
 
         thread::spawn(move || {
+            let done = ReaderDone(tx);
             let mut buf = [0u8; 16384];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if tx.send(buf[..n].to_vec()).is_err() {
+                        if done.0.send(buf[..n].to_vec()).is_err() {
                             break;
                         }
                         crate::wake::poke();
                     }
                 }
             }
-            let _ = tx.send(b"\r\n\x1b[90m[process exited]\x1b[0m\r\n".to_vec());
-            crate::wake::poke();
         });
         thread::spawn(move || {
             let _ = child.wait();

@@ -251,11 +251,31 @@ pub(super) fn workspace(ctx: &egui::Context, app: &mut OpenTerm, acts: &mut Vec<
                     let connection_error = app.connection_errors.get(&app.selected).cloned();
                     match app.active_session() {
                         Some(s) => {
+                            if let Some(error) = &s.connection_error {
+                                let reconnecting =
+                                    app.pending.iter().any(|pending| pending.device == s.device);
+                                let error = connection_error.as_ref().unwrap_or(error);
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("SSH session ended").color(red()))
+                                        .on_hover_text(error);
+                                    let label = if reconnecting {
+                                        "Reconnecting…"
+                                    } else {
+                                        "Reconnect"
+                                    };
+                                    if ui
+                                        .add_enabled(!reconnecting, egui::Button::new(label))
+                                        .clicked()
+                                    {
+                                        acts.push(Act::NewSession(s.device.clone()));
+                                    }
+                                });
+                            }
                             let r = Rect::from_min_max(
-                                area.min + vec2(14.0, 10.0),
+                                pos2(area.left() + 14.0, ui.next_widget_position().y + 10.0),
                                 area.max - vec2(10.0, 6.0),
                             );
-                            s.term.ui(ui, r, !modal);
+                            s.term.ui(ui, r, !modal && s.connection_error.is_none());
                         }
                         None => {
                             let c = area.center();

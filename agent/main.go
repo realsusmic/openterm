@@ -137,6 +137,7 @@ type Channel struct {
 	id      string
 	session *ssh.Session
 	stdin   io.WriteCloser
+	failed  sync.Once
 }
 
 type Agent struct {
@@ -480,14 +481,14 @@ func (a *Agent) exec(m Msg) {
 	}
 	sess, err := s.client.NewSession()
 	if err != nil {
-		a.send(Msg{Session: m.Session, Ok: false, Err: err.Error()})
+		a.send(Msg{Chan: m.Chan, Ok: false, Err: err.Error()})
 		return
 	}
 	if m.Pty {
 		modes := ssh.TerminalModes{ssh.ECHO: 1, ssh.TTY_OP_ISPEED: 14400, ssh.TTY_OP_OSPEED: 14400}
 		if err := sess.RequestPty("xterm-256color", m.Rows, m.Cols, modes); err != nil {
 			_ = sess.Close()
-			a.send(Msg{Session: m.Session, Ok: false, Err: err.Error()})
+			a.send(Msg{Chan: m.Chan, Ok: false, Err: err.Error()})
 			return
 		}
 	}
@@ -534,12 +535,25 @@ func (a *Agent) exec(m Msg) {
 	a.mu.Unlock()
 	a.send(Msg{Session: m.Session, Chan: cid, Ok: true})
 
-	go a.pump(cid, "stdout", stdout)
-	go a.pump(cid, "stderr", stderr)
+	var output sync.WaitGroup
+	output.Add(2)
 	go func() {
-		_ = sess.Wait()
+		defer output.Done()
+		a.pump(cid, "stdout", stdout)
+	}()
+	go func() {
+		defer output.Done()
+		a.pump(cid, "stderr", stderr)
+	}()
+	go func() {
+		err := sess.Wait()
+		output.Wait()
 		a.removeChannel(cid)
-		a.send(Msg{Chan: cid, Stream: "exit", Ok: true})
+		if err != nil {
+			a.send(Msg{Chan: cid, Stream: "exit", Err: err.Error()})
+		} else {
+			a.send(Msg{Chan: cid, Stream: "exit", Ok: true})
+		}
 	}()
 }
 
@@ -565,7 +579,13 @@ func (a *Agent) write(m Msg) {
 	if err != nil {
 		return
 	}
-	_, _ = ch.stdin.Write(data)
+	n, err := ch.stdin.Write(data)
+	if err == nil && n != len(data) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		a.failChannel(ch, "write to SSH shell", err)
+	}
 }
 
 func (a *Agent) resize(m Msg) {
@@ -573,7 +593,17 @@ func (a *Agent) resize(m Msg) {
 	if ch == nil {
 		return
 	}
-	_ = ch.session.WindowChange(m.Rows, m.Cols)
+	if err := ch.session.WindowChange(m.Rows, m.Cols); err != nil {
+		a.failChannel(ch, "resize SSH shell", err)
+	}
+}
+
+func (a *Agent) failChannel(ch *Channel, action string, err error) {
+	ch.failed.Do(func() {
+		a.send(Msg{Chan: ch.id, Stream: "error", Err: fmt.Sprintf("%s: %v", action, err)})
+		a.removeChannel(ch.id)
+		_ = ch.session.Close()
+	})
 }
 
 func (a *Agent) closeChan(m Msg) {
@@ -816,23 +846,6 @@ func (a *Agent) sftpPut(m Msg) {
 	a.send(Msg{ID: m.ID, Ok: true, Message: fmt.Sprintf("%d bytes", info.Size())})
 }
 
-func cleanRemoteJoin(root, rel string) string {
-	rel = strings.TrimLeft(filepath.ToSlash(rel), "/")
-	if rel == "" || rel == "." {
-		return root
-	}
-	return path.Join(root, rel)
-}
-
-func remoteRelative(root, name string) string {
-	r := strings.TrimRight(filepath.ToSlash(root), "/")
-	n := filepath.ToSlash(name)
-	if n == r {
-		return ""
-	}
-	return strings.TrimLeft(strings.TrimPrefix(n, r), "/")
-}
-
 const transferWorkers = 6
 
 type transferJob struct {
@@ -881,37 +894,49 @@ func (a *Agent) sftpGetTree(m Msg) {
 		return
 	}
 	jobs := make([]transferJob, 0)
-	walker := s.sftp.Walk(m.Remote)
-	for walker.Step() {
-		if walker.Err() != nil {
-			a.send(Msg{ID: m.ID, Ok: false, Err: walker.Err().Error()})
-			return
+	err := walkRemoteTree(s.sftp, m.Remote, func(remote, relative string, info os.FileInfo) error {
+		local, err := localTreePath(relative)
+		if err != nil {
+			return err
 		}
-		rel := remoteRelative(m.Remote, walker.Path())
-		local := filepath.Join(m.Local, filepath.FromSlash(rel))
-		if walker.Stat().IsDir() {
-			if err := os.MkdirAll(local, 0o755); err != nil {
-				a.send(Msg{ID: m.ID, Ok: false, Err: err.Error()})
+		jobs = append(jobs, transferJob{remote: remote, local: local, size: info.Size(), dir: info.IsDir()})
+		return nil
+	})
+	if err != nil {
+		a.send(Msg{ID: m.ID, Err: err.Error()})
+		return
+	}
+	root, err := openDownloadRoot(m.Local)
+	if err != nil {
+		a.send(Msg{ID: m.ID, Err: err.Error()})
+		return
+	}
+	defer root.Close()
+	for _, job := range jobs {
+		if job.dir {
+			if err := root.MkdirAll(job.local, 0o755); err != nil {
+				a.send(Msg{ID: m.ID, Err: err.Error()})
 				return
 			}
-			continue
 		}
-		if !walker.Stat().Mode().IsRegular() {
-			continue
-		}
-		jobs = append(jobs, transferJob{remote: walker.Path(), local: local, size: walker.Stat().Size()})
 	}
 	if err := runTransferJobs(jobs, func(job transferJob) error {
-		return copyRemoteToLocal(s.sftp, job.remote, job.local)
+		if job.dir {
+			return nil
+		}
+		return copyRemoteToRoot(s.sftp, job.remote, root, job.local)
 	}); err != nil {
 		a.send(Msg{ID: m.ID, Ok: false, Err: err.Error()})
 		return
 	}
-	total := int64(0)
+	count, total := 0, int64(0)
 	for _, job := range jobs {
-		total += job.size
+		if !job.dir {
+			count++
+			total += job.size
+		}
 	}
-	a.send(Msg{ID: m.ID, Ok: true, Message: fmt.Sprintf("downloaded %d files (%d bytes)", len(jobs), total)})
+	a.send(Msg{ID: m.ID, Ok: true, Message: fmt.Sprintf("downloaded %d files (%d bytes)", count, total)})
 }
 
 func (a *Agent) sftpPutTree(m Msg) {
@@ -935,7 +960,10 @@ func (a *Agent) sftpPutTree(m Msg) {
 		if err != nil {
 			return err
 		}
-		remote := cleanRemoteJoin(m.Remote, rel)
+		remote, err := remoteTreePath(m.Remote, filepath.ToSlash(rel))
+		if err != nil {
+			return err
+		}
 		if info.IsDir() {
 			jobs = append(jobs, transferJob{remote: remote, dir: true})
 			return nil
@@ -1007,21 +1035,13 @@ func localManifest(root string) (map[string]manifestItem, error) {
 
 func remoteManifest(client *sftp.Client, root string) (map[string]manifestItem, error) {
 	out := map[string]manifestItem{}
-	walker := client.Walk(root)
-	for walker.Step() {
-		if walker.Err() != nil {
-			return nil, walker.Err()
+	err := walkRemoteTree(client, root, func(_, relative string, info os.FileInfo) error {
+		if info.Mode().IsRegular() {
+			out[relative] = manifestItem{size: info.Size(), modTime: info.ModTime().Unix()}
 		}
-		info := walker.Stat()
-		if info.IsDir() || !info.Mode().IsRegular() {
-			continue
-		}
-		out[remoteRelative(root, walker.Path())] = manifestItem{
-			size:    info.Size(),
-			modTime: info.ModTime().Unix(),
-		}
-	}
-	return out, nil
+		return nil
+	})
+	return out, err
 }
 
 func syncPlan(local, remote map[string]manifestItem, direction string) []SyncChange {
@@ -1098,17 +1118,36 @@ func (a *Agent) sftpSyncApply(m Msg) {
 	}
 	jobs := make([]transferJob, 0, len(changes))
 	for _, change := range changes {
+		local, err := localTreePath(change.Path)
+		if err != nil {
+			a.send(Msg{ID: m.ID, Err: err.Error()})
+			return
+		}
+		remote, err := remoteTreePath(m.Remote, change.Path)
+		if err != nil {
+			a.send(Msg{ID: m.ID, Err: err.Error()})
+			return
+		}
 		jobs = append(jobs, transferJob{
-			local:  filepath.Join(m.Local, filepath.FromSlash(change.Path)),
-			remote: cleanRemoteJoin(m.Remote, change.Path),
+			local:  local,
+			remote: remote,
 			size:   change.Size,
 		})
 	}
-	err = runTransferJobs(jobs, func(job transferJob) error {
-		if m.Direction == "remote_to_local" {
-			return copyRemoteToLocal(s.sftp, job.remote, job.local)
+	var root *os.Root
+	if m.Direction == "remote_to_local" {
+		root, err = openDownloadRoot(m.Local)
+		if err != nil {
+			a.send(Msg{ID: m.ID, Err: err.Error()})
+			return
 		}
-		return copyLocalToRemote(s.sftp, job.local, job.remote)
+		defer root.Close()
+	}
+	err = runTransferJobs(jobs, func(job transferJob) error {
+		if root != nil {
+			return copyRemoteToRoot(s.sftp, job.remote, root, job.local)
+		}
+		return copyLocalToRemote(s.sftp, filepath.Join(m.Local, job.local), job.remote)
 	})
 	if err != nil {
 		a.send(Msg{ID: m.ID, Ok: false, Err: err.Error()})
@@ -1199,7 +1238,7 @@ func (a *Agent) removeChannel(cid string) {
 }
 
 const (
-	agentProtocolVersion  = 4
+	agentProtocolVersion  = 5
 	maxControlFrame       = 8 * 1024 * 1024
 	maxEditorMsgpackFrame = 272 * 1024 * 1024
 	maxSecretSize         = 1024 * 1024

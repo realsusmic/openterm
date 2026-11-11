@@ -107,7 +107,15 @@ pub fn mono(size: f32) -> FontId {
     FontId::monospace(size)
 }
 
-pub fn install(ctx: &egui::Context, mode: ThemeMode) {
+fn terminal_family() -> FontFamily {
+    FontFamily::Name("terminal".into())
+}
+
+pub fn terminal_font() -> FontId {
+    FontId::new(MONO_SIZE, terminal_family())
+}
+
+pub fn set_terminal_font(ctx: &egui::Context, selected: Option<FontData>) {
     // ---- fonts (both OFL) ----
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert(
@@ -128,6 +136,13 @@ pub fn install(ctx: &egui::Context, mode: ThemeMode) {
     prop.insert(1, "jbmono".into()); // glyph fallback (arrows, box drawing)
     let monof = fonts.families.entry(FontFamily::Monospace).or_default();
     monof.insert(0, "jbmono".into());
+    let mut terminal = monof.clone();
+    if let Some(font) = selected {
+        let name = "installed-terminal-font".to_owned();
+        fonts.font_data.insert(name.clone(), font);
+        terminal.insert(0, name);
+    }
+    fonts.families.insert(terminal_family(), terminal);
     let mut med = vec!["inter-medium".to_string(), "jbmono".to_string()];
     med.extend(
         fonts.families[&FontFamily::Proportional]
@@ -139,7 +154,10 @@ pub fn install(ctx: &egui::Context, mode: ThemeMode) {
         .families
         .insert(FontFamily::Name("medium".into()), med);
     ctx.set_fonts(fonts);
+}
 
+pub fn install(ctx: &egui::Context, mode: ThemeMode) {
+    set_terminal_font(ctx, None);
     apply(ctx, mode);
 
     // ---- style ----

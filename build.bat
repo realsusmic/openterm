@@ -186,7 +186,7 @@ echo.
 echo required toolchains:
 echo   rust  : https://rustup.rs
 echo   zig   : https://ziglang.org/download/     ^(0.13+^)
-echo   go    : https://go.dev/dl/                 ^(1.22+^)
+echo   go    : https://go.dev/dl/                 ^(1.25+^)
 echo   C     : Visual Studio Build Tools (MSVC)   OR LLVM/clang
 goto :fail
 

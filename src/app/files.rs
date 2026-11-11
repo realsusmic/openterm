@@ -7,8 +7,86 @@ use super::{
 use crate::ssh::SftpHandle;
 use crate::wake;
 use anyhow::{anyhow, Context};
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+
+const MAX_LOCAL_EDITOR_FILE: u64 = 256 * 1024 * 1024;
+
+pub(super) fn suggested_download_path(remote: &str, fallback: &str) -> String {
+    let name = remote
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next();
+    let name = name
+        .filter(|name| {
+            !name.is_empty()
+                && *name != "."
+                && *name != ".."
+                && !name.chars().any(|c| c.is_control() || c == ':')
+        })
+        .unwrap_or(fallback);
+    dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_default()
+        .join(name)
+        .display()
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editor_reads_up_to_the_limit() {
+        let path =
+            std::env::temp_dir().join(format!("openterm-editor-{}.txt", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"1234").unwrap();
+        let exact = read_editor_file(&path, 4);
+        let oversized = read_editor_file(&path, 3);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(exact.unwrap(), b"1234");
+        assert!(oversized.is_err());
+    }
+}
+
+fn read_editor_file(path: &Path, limit: u64) -> anyhow::Result<Vec<u8>> {
+    let metadata = path.metadata()?;
+    anyhow::ensure!(metadata.is_file(), "the editor can only open regular files");
+    let oversized = || {
+        anyhow!(
+            "file exceeds the {} MiB editor limit",
+            limit / (1024 * 1024)
+        )
+    };
+    if metadata.len() > limit {
+        return Err(oversized());
+    }
+    let mut file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    anyhow::ensure!(metadata.is_file(), "the editor can only open regular files");
+    if metadata.len() > limit {
+        return Err(oversized());
+    }
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(metadata.len() as usize)?;
+    let mut chunk = [0; 64 * 1024];
+    loop {
+        let count = match file.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if bytes.len() as u64 + count as u64 > limit {
+            return Err(oversized());
+        }
+        bytes.try_reserve_exact(count)?;
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    Ok(bytes)
+}
 
 impl OpenTerm {
     pub(super) fn large_file_notice(&mut self, ctx: &egui::Context) {
@@ -23,7 +101,7 @@ impl OpenTerm {
         let (tx, rx) = mpsc::channel();
         let request_path = path.clone();
         std::thread::spawn(move || {
-            let result = std::fs::read(&request_path)
+            let result = read_editor_file(&request_path, MAX_LOCAL_EDITOR_FILE)
                 .with_context(|| format!("read {}", request_path.display()));
             let _ = tx.send(result);
             wake::poke();
@@ -130,20 +208,10 @@ impl OpenTerm {
                     let p = self.pending_remote_files.remove(i);
                     match result {
                         Ok(bytes) if !crate::editor::is_text_bytes(&bytes) => {
-                            let name = p
-                                .path
-                                .trim_end_matches(['/', '\\'])
-                                .rsplit(['/', '\\'])
-                                .next()
-                                .filter(|name| !name.is_empty())
-                                .unwrap_or("download.bin")
-                                .to_string();
-                            let base = dirs::download_dir()
-                                .or_else(dirs::home_dir)
-                                .unwrap_or_default();
+                            let local = suggested_download_path(&p.path, "download.bin");
                             self.binary_file_dialog = Some(BinaryFileDialog {
                                 remote: p.path,
-                                local: base.join(name).display().to_string(),
+                                local,
                                 bytes,
                                 error: None,
                             });

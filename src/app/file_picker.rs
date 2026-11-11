@@ -1,6 +1,7 @@
 use super::AppResult;
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(windows, test, all(unix, not(target_os = "macos"))))]
 use anyhow::anyhow;
+#[cfg(any(windows, target_os = "macos"))]
 use anyhow::Context;
 use std::{path::Path, process::Command};
 
@@ -65,23 +66,95 @@ pub(super) fn pick_local_folder(_start: &str) -> AppResult<Option<String>> {
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(super) fn pick_local_folder(start: &str) -> AppResult<Option<String>> {
     let zenity_start = format!("--filename={}/", start.trim_end_matches('/'));
-    let attempts = [
-        (
-            "zenity",
-            vec!["--file-selection", "--directory", &zenity_start],
-        ),
-        ("kdialog", vec!["--getexistingdirectory", start]),
-    ];
-    for (program, args) in attempts {
-        match Command::new(program).args(args).output() {
+    try_folder_pickers(
+        &[
+            (
+                "zenity",
+                &["--file-selection", "--directory", &zenity_start],
+            ),
+            ("kdialog", &["--getexistingdirectory", start]),
+        ],
+        |program, args| Command::new(program).args(args).output(),
+    )
+}
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn try_folder_pickers(
+    attempts: &[(&str, &[&str])],
+    mut run: impl FnMut(&str, &[&str]) -> std::io::Result<std::process::Output>,
+) -> AppResult<Option<String>> {
+    let mut failures = Vec::new();
+    for &(program, args) in attempts {
+        match run(program, args) {
             Ok(output) if output.status.success() => {
                 let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 return Ok((!selected.is_empty()).then_some(selected));
             }
-            Ok(_) => return Ok(None),
+            Ok(output)
+                if output.status.code() == Some(1)
+                    && String::from_utf8_lossy(&output.stderr).trim().is_empty() =>
+            {
+                return Ok(None);
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                failures.push(format!("{program} ({}) {}", output.status, stderr.trim()));
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error).context("couldn't open the folder picker"),
+            Err(error) => failures.push(format!("{program}: {error}")),
         }
     }
-    Err(anyhow!("No folder picker is installed (tried zenity and kdialog). You can still enter the path manually."))
+    if failures.is_empty() {
+        Err(anyhow!("No folder picker is installed (tried zenity and kdialog). You can still enter the path manually."))
+    } else {
+        Err(anyhow!(
+            "Couldn't open a folder picker. {}. You can enter the path manually.",
+            failures.join("; ")
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::try_folder_pickers;
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+    #[cfg(windows)]
+    use std::os::windows::process::ExitStatusExt;
+    use std::process::{ExitStatus, Output};
+
+    fn output(code: u8, stdout: &str, stderr: &str) -> Output {
+        #[cfg(unix)]
+        let status = ExitStatus::from_raw(i32::from(code) << 8);
+        #[cfg(windows)]
+        let status = ExitStatus::from_raw(u32::from(code));
+        Output {
+            status,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        }
+    }
+
+    #[test]
+    fn retries_with_second_picker_after_a_launch_error() {
+        let picked = try_folder_pickers(&[("zenity", &[]), ("kdialog", &[])], |program, _| {
+            Ok(if program == "zenity" {
+                output(1, "", "cannot open display")
+            } else {
+                output(0, "/home/user/project\n", "")
+            })
+        })
+        .unwrap();
+        assert_eq!(picked.as_deref(), Some("/home/user/project"));
+    }
+
+    #[test]
+    fn cancellation_does_not_open_a_second_picker() {
+        let picked = try_folder_pickers(&[("zenity", &[]), ("kdialog", &[])], |program, _| {
+            assert_eq!(program, "zenity");
+            Ok(output(1, "", ""))
+        })
+        .unwrap();
+        assert_eq!(picked, None);
+    }
 }

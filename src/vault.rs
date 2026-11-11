@@ -349,6 +349,11 @@ impl Vault {
         if self.key.is_some() {
             return Ok(());
         }
+        if self.file.check.is_none() && self.file.records.is_empty() {
+            return Err(UnlockError::Other(anyhow!(
+                "vault has no authenticated key check or records; restore a valid backup or reset the vault"
+            )));
+        }
         let salt = decode_salt(&self.file.salt).map_err(UnlockError::Other)?;
         let key = match self.file.mode {
             Mode::Password => {
@@ -358,9 +363,6 @@ impl Vault {
             Mode::Os => {
                 let seed = match load_os_seed().map_err(UnlockError::Other)? {
                     Some(seed) => seed,
-                    None if self.file.records.is_empty() => {
-                        ensure_os_seed().map_err(UnlockError::Other)?
-                    }
                     None => {
                         return Err(UnlockError::Other(anyhow!(
                             "the OS keystore key for this vault is missing"
@@ -1029,6 +1031,26 @@ mod tests {
             Err(UnlockError::BadPassword)
         ));
         v2.unlock(Some("rightpass")).unwrap();
+    }
+
+    #[test]
+    fn empty_vault_without_key_check_cannot_bind_a_new_password() {
+        let (_guard, _dir) = tmp_env();
+        let mut vault = Vault::create(Mode::Password, Some("rightpass")).unwrap();
+        vault.lock();
+        vault.file.check = None;
+        vault.save().unwrap();
+        let path = Vault::config_path().unwrap();
+        let original = std::fs::read(&path).unwrap();
+
+        for password in ["wrongpass", "rightpass"] {
+            assert!(matches!(
+                vault.unlock(Some(password)),
+                Err(UnlockError::Other(_))
+            ));
+        }
+        assert!(!vault.is_unlocked());
+        assert_eq!(std::fs::read(path).unwrap(), original);
     }
 
     #[test]

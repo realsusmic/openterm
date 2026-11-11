@@ -11,12 +11,15 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-const AGENT_PROTOCOL_VERSION: u32 = 4;
+const AGENT_PROTOCOL_VERSION: u32 = 5;
 const MAX_EDITOR_PAYLOAD: usize = 272 * 1024 * 1024;
 
 #[derive(Serialize)]
@@ -152,10 +155,11 @@ pub struct AuthSpec {
 }
 
 pub struct Agent {
-    _child: Child,
+    child: Child,
     stdin: Arc<Mutex<ChildStdin>>,
     // One broadcast channel; each SSH session subscribes and filters.
     subscribers: Arc<Mutex<Vec<Sender<AgentMsg>>>>,
+    running: Arc<AtomicBool>,
 }
 
 impl Agent {
@@ -181,6 +185,7 @@ impl Agent {
         let subscribers: Arc<Mutex<Vec<Sender<AgentMsg>>>> = Arc::new(Mutex::new(Vec::new()));
         let (router_tx, router_rx) = mpsc::channel::<AgentMsg>();
         let last_stderr = Arc::new(Mutex::new(None::<String>));
+        let running = Arc::new(AtomicBool::new(true));
 
         // Keep the sidecar invisible on Windows, but preserve its last useful
         // diagnostic so a crash becomes an actionable connection error.
@@ -192,7 +197,8 @@ impl Agent {
         // reader: parse JSON lines, push to router
         {
             let router_tx = router_tx.clone();
-            thread::spawn(move || reader_loop(stdout, router_tx, last_stderr));
+            let running = running.clone();
+            thread::spawn(move || reader_loop(stdout, router_tx, last_stderr, running));
         }
         // dispatcher: fan out to subscribers
         {
@@ -205,14 +211,17 @@ impl Agent {
                     // senders here would otherwise grow the list forever.
                     let mut subs = subs;
                     subs.retain(|s| s.send(m.clone()).is_ok());
+                    drop(subs);
+                    crate::wake::poke();
                 }
             });
         }
 
-        let mut agent = Self {
-            _child: child,
+        let agent = Self {
+            child,
             stdin,
             subscribers,
+            running,
         };
         let handshake = agent.request(
             AgentMsg {
@@ -226,7 +235,6 @@ impl Agent {
         match handshake {
             Ok(reply) if reply.protocol == Some(AGENT_PROTOCOL_VERSION) => Ok(agent),
             Ok(reply) => {
-                let _ = agent._child.kill();
                 Err(anyhow!(
                     "otm-agent protocol mismatch: app requires {}, agent reported {}; rebuild and ship both binaries together",
                     AGENT_PROTOCOL_VERSION,
@@ -234,7 +242,6 @@ impl Agent {
                 ))
             }
             Err(error) => {
-                let _ = agent._child.kill();
                 Err(anyhow!(
                     "otm-agent is incompatible with this OpenTerm build ({error}); rebuild and ship both binaries together"
                 ))
@@ -246,6 +253,10 @@ impl Agent {
         let (tx, rx) = mpsc::channel();
         self.subscribers.lock().push(tx);
         rx
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Acquire)
     }
 
     pub fn send(&self, m: &AgentMsg) -> Result<()> {
@@ -605,7 +616,19 @@ fn capture_stderr(stderr: ChildStderr, last_stderr: Arc<Mutex<Option<String>>>) 
     }
 }
 
-fn reader_loop(stdout: ChildStdout, tx: Sender<AgentMsg>, last_stderr: Arc<Mutex<Option<String>>>) {
+impl Drop for Agent {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn reader_loop(
+    stdout: ChildStdout,
+    tx: Sender<AgentMsg>,
+    last_stderr: Arc<Mutex<Option<String>>>,
+    running: Arc<AtomicBool>,
+) {
     let mut reader = BufReader::new(stdout);
     loop {
         let mut line = String::new();
@@ -639,9 +662,9 @@ fn reader_loop(stdout: ChildStdout, tx: Sender<AgentMsg>, last_stderr: Arc<Mutex
                 m.binary = Some(Arc::from(decoded));
             }
             let _ = tx.send(m);
-            crate::wake::poke();
         }
     }
+    running.store(false, Ordering::Release);
     // stderr and stdout close together on process exit; give the stderr reader
     // a moment to publish the final panic/fatal line before reporting the exit.
     thread::sleep(Duration::from_millis(20));
@@ -656,7 +679,6 @@ fn reader_loop(stdout: ChildStdout, tx: Sender<AgentMsg>, last_stderr: Arc<Mutex
         err: Some(err),
         ..Default::default()
     });
-    crate::wake::poke();
 }
 
 #[cfg(test)]

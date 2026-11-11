@@ -131,6 +131,7 @@ impl OpenTerm {
             label,
             device: "local".into(),
             backend: None,
+            connection_error: None,
             launch: Some((program, args)),
             term,
             remote_tree: None,
@@ -265,6 +266,7 @@ impl OpenTerm {
                     label,
                     device: device_id.clone(),
                     backend: Some(Backend::Local(pty)),
+                    connection_error: None,
                     launch: None,
                     term: TermView::new(),
                     remote_tree: None,
@@ -482,6 +484,7 @@ impl OpenTerm {
                                 label: p.label.clone(),
                                 device: p.device.clone(),
                                 backend: Some(Backend::Ssh(sess)),
+                                connection_error: None,
                                 launch: None,
                                 term: TermView::new(),
                                 remote_tree: Some(RemoteNode::root(".")),
@@ -595,16 +598,26 @@ impl OpenTerm {
                 continue;
             }
             let b = s.backend.as_ref().unwrap();
-            if let Some((c, r)) = s.term.take_resize() {
-                b.resize(c, r);
-            }
-            let out = b.drain();
+            let (out, mut ended) = b.drain();
             if !out.is_empty() {
                 s.term.feed(&out);
             }
-            let input = s.term.take_input();
-            if !input.is_empty() {
-                b.write(&input);
+            if ended.is_none() {
+                let result = (|| {
+                    if let Some((c, r)) = s.term.take_resize() {
+                        b.resize(c, r)?;
+                    }
+                    let input = s.term.take_input();
+                    if !input.is_empty() {
+                        b.write(&input)?;
+                    }
+                    Ok::<_, anyhow::Error>(())
+                })();
+                ended = result.err().map(|error| format!("{error:#}"));
+            }
+            if let Some(error) = ended {
+                s.backend = None;
+                s.connection_error = Some(error);
             }
         }
         if let Some(e) = failed {

@@ -2,6 +2,7 @@
 
 use super::commands::{launch_external, os_unlock_error};
 use super::file_picker::{pick_local_folder, sync_root_too_broad};
+use super::files::suggested_download_path;
 use super::{
     resolved_terminal, Act, AuthMode, CommandProfile, ConnectionType, DeviceKind, OpenTerm,
     PendingBinaryDownload, PendingTransfer, RenameDeviceDialog, SyncDirection, TransferDialog,
@@ -108,11 +109,21 @@ impl OpenTerm {
                         if let Some(backend) =
                             self.active_session().and_then(|s| s.backend.as_ref())
                         {
-                            backend.write(command.as_bytes());
-                            backend.write(b"\r");
+                            if let Err(error) = backend.write(format!("{command}\r").as_bytes()) {
+                                self.say(ctx, format!("{error:#}"), true);
+                            }
                         }
                     }
-                    Some((_, false)) => self.say(ctx, "shell is still starting…", false),
+                    Some((_, false)) => {
+                        if self
+                            .active_session()
+                            .is_some_and(|session| session.connection_error.is_some())
+                        {
+                            self.say(ctx, "Reconnect the SSH session to run Info", true);
+                        } else {
+                            self.say(ctx, "shell is still starting…", false);
+                        }
+                    }
                     None => self.say(ctx, "open a terminal session first", true),
                 }
             }
@@ -144,6 +155,24 @@ impl OpenTerm {
                     return;
                 }
                 self.settings.default_shell = terminal.setting_id().into();
+                if let Err(error) = self.settings.save() {
+                    self.say(ctx, format!("couldn't save settings: {error}"), true);
+                }
+            }
+            Act::SetTerminalFont(family) => {
+                let font = match family
+                    .as_deref()
+                    .map(|name| self.load_terminal_font(name))
+                    .transpose()
+                {
+                    Ok(font) => font,
+                    Err(error) => {
+                        self.say(ctx, format!("couldn't load terminal font: {error:#}"), true);
+                        return;
+                    }
+                };
+                theme::set_terminal_font(ctx, font);
+                self.settings.terminal_font = family;
                 if let Err(error) = self.settings.save() {
                     self.say(ctx, format!("couldn't save settings: {error}"), true);
                 }
@@ -712,20 +741,11 @@ impl OpenTerm {
                 }
             }
             Act::RemoteDownload(id, remote, recursive) => {
-                let name = remote
-                    .trim_end_matches(['/', '\\'])
-                    .rsplit(['/', '\\'])
-                    .next()
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or("download")
-                    .to_string();
-                let base = dirs::download_dir()
-                    .or_else(dirs::home_dir)
-                    .unwrap_or_default();
+                let local = suggested_download_path(&remote, "download");
                 self.transfer_dialog = Some(TransferDialog {
                     session_id: id,
                     remote,
-                    local: base.join(&name).display().to_string(),
+                    local,
                     mode: if recursive {
                         TransferMode::DownloadFolder
                     } else {

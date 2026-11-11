@@ -143,6 +143,8 @@ impl TermState {
     }
 
     fn linefeed(&mut self) {
+        // Scroll only at the bottom margin. Below it, LF can advance to the
+        // physical bottom but must not scroll an unrelated region.
         if self.cy + 1 == self.bot {
             if self.top == 0 {
                 self.push_scrollback(0);
@@ -310,7 +312,10 @@ impl TermState {
                     self.grid.clear_rect(0, 0, cols, self.cy);
                     self.grid.clear_rect(0, self.cy, self.cx + 1, 1);
                 }
-                3 => self.scrollback.clear(),
+                3 => {
+                    self.scrollback.clear();
+                    self.grid.clear_rect(0, 0, cols, rows);
+                }
                 _ => self.grid.clear_rect(0, 0, cols, rows),
             },
             b'K' => match raw0 {
@@ -758,7 +763,7 @@ impl TermView {
     /// draw + handle input. `interactive = false` (e.g. a modal is open) makes the
     /// terminal give up keyboard focus and ignore keys.
     pub fn ui(&self, ui: &mut egui::Ui, rect: Rect, interactive: bool) {
-        let font = theme::mono(theme::MONO_SIZE);
+        let font = theme::terminal_font();
         let cw = ui.fonts(|f| f.glyph_width(&font, 'M'));
         let ch = ui.fonts(|f| f.row_height(&font)).ceil();
         let cols = ((rect.width() / cw).floor() as u16).max(10);
@@ -1274,6 +1279,30 @@ fn key_bytes(k: Key, m: Modifiers, app_cursor: bool) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn erase_saved_lines_also_clears_the_display() {
+        let term = TermView::new();
+        term.feed(b"visible");
+        {
+            let mut term = term.inner.lock();
+            term.state.push_scrollback(0);
+            assert!(!term.state.scrollback.is_empty());
+        }
+        term.feed(b"\x1b[3J");
+        let term = term.inner.lock();
+        assert!(term.state.scrollback.is_empty());
+        assert_eq!(term.state.grid.get(0, 0).unwrap().glyph, ' ' as u32);
+    }
+
+    #[test]
+    fn shrinking_margins_homes_the_cursor_and_linefeed_respects_them() {
+        let term = TermView::new();
+        term.feed(b"\x1b[24;1H\x1b[2;4r\n");
+        let term = term.inner.lock();
+        assert_eq!(term.state.cy, 1);
+        assert_eq!((term.state.top, term.state.bot), (1, 4));
+    }
 
     #[derive(Default)]
     struct ParserEvents {

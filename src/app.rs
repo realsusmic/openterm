@@ -28,6 +28,7 @@ mod files;
 mod sessions;
 mod settings_ui;
 mod sidebar;
+mod terminal_fonts;
 mod transfer_ui;
 mod vault_ui;
 mod widgets;
@@ -40,6 +41,7 @@ use commands::os_unlock_error;
 use connection_ui::{host_key_dialog, rename_device_dialog, ssh_modal};
 use settings_ui::settings_dialog;
 use sidebar::sidebar;
+use terminal_fonts::TerminalFonts;
 use transfer_ui::{binary_file_dialog, transfer_dialog};
 use vault_ui::vault_dialog;
 use workspace::workspace;
@@ -51,21 +53,27 @@ enum Backend {
     Ssh(SshSession),
 }
 impl Backend {
-    fn write(&self, d: &[u8]) {
+    fn write(&self, d: &[u8]) -> AppResult<()> {
         match self {
-            Self::Local(p) => p.write(d),
+            Self::Local(p) => {
+                p.write(d);
+                Ok(())
+            }
             Self::Ssh(s) => s.write(d),
         }
     }
-    fn resize(&self, c: u16, r: u16) {
+    fn resize(&self, c: u16, r: u16) -> AppResult<()> {
         match self {
-            Self::Local(p) => p.resize(c, r),
+            Self::Local(p) => {
+                p.resize(c, r);
+                Ok(())
+            }
             Self::Ssh(s) => s.resize(c, r),
         }
     }
-    fn drain(&self) -> Vec<u8> {
+    fn drain(&self) -> (Vec<u8>, Option<String>) {
         match self {
-            Self::Local(p) => p.drain(),
+            Self::Local(p) => (p.drain(), None),
             Self::Ssh(s) => s.drain(),
         }
     }
@@ -82,6 +90,7 @@ struct Session {
     label: String,
     device: String,
     backend: Option<Backend>, // local shells spawn lazily once the real size is known
+    connection_error: Option<String>,
     launch: Option<(String, Vec<String>)>,
     term: TermView,
     remote_tree: Option<RemoteNode>,
@@ -450,6 +459,7 @@ enum Act {
     OpenSettings,
     CloseSettings,
     SetTheme(ThemeMode),
+    SetTerminalFont(Option<String>),
     SetDefaultShell(TerminalKind),
     SetVaultGrace(u64, VaultGraceUnit),
     Connect,
@@ -497,6 +507,7 @@ pub struct OpenTerm {
     modal: bool,
     settings_open: bool,
     settings: Settings,
+    terminal_fonts: TerminalFonts,
     available_terminals: Vec<TerminalKind>,
     form: SshForm,
     pending: Vec<Pending>,
@@ -522,6 +533,7 @@ pub struct OpenTerm {
 impl OpenTerm {
     pub fn new(cc: &eframe::CreationContext, mut settings: Settings) -> Self {
         wake::set(cc.egui_ctx.clone());
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         let available_terminals = available_terminals();
         let default_terminal = resolved_terminal(&settings.default_shell, &available_terminals);
         if !available_terminals.is_empty()
@@ -563,6 +575,7 @@ impl OpenTerm {
             modal: false,
             settings_open: false,
             settings,
+            terminal_fonts: TerminalFonts::scan(cc.egui_ctx.clone()),
             available_terminals,
             form: SshForm {
                 port: "22".into(),
@@ -652,6 +665,14 @@ impl eframe::App for OpenTerm {
 
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         let mut acts = Vec::new();
+        if self.terminal_fonts.poll() {
+            if let Some(family) = self.settings.terminal_font.as_deref() {
+                match self.load_terminal_font(family) {
+                    Ok(font) => set_terminal_font(ctx, Some(font)),
+                    Err(error) => log::warn!("couldn't restore terminal font {family}: {error:#}"),
+                }
+            }
+        }
         if let Some(inner) = ctx.input(|input| input.viewport().inner_rect) {
             let minimum = vec2(crate::MIN_WINDOW_SIZE[0], crate::MIN_WINDOW_SIZE[1]);
             if inner.width() + 1.0 < minimum.x || inner.height() + 1.0 < minimum.y {
@@ -721,7 +742,13 @@ impl eframe::App for OpenTerm {
         }
         vault_dialog(ctx, &mut self.vault_ui, &mut acts);
         if self.settings_open && matches!(self.vault_ui, VaultState::Ready | VaultState::Idle) {
-            settings_dialog(ctx, &self.settings, &self.available_terminals, &mut acts);
+            settings_dialog(
+                ctx,
+                &self.settings,
+                &self.available_terminals,
+                &self.terminal_fonts,
+                &mut acts,
+            );
         }
         if self.modal
             && !self.settings_open

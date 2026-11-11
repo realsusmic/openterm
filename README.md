@@ -83,7 +83,7 @@ openterm/
 |------|-------------|-----------------|
 | Rust | 1.77 | https://rustup.rs |
 | Zig | 0.13 | https://ziglang.org/download/ |
-| Go | 1.22 | https://go.dev/dl/ |
+| Go | 1.25 | https://go.dev/dl/ |
 | C compiler | any supported | Windows MSVC targets require Visual Studio Build Tools (`cl.exe`) or `clang-cl`; macOS/Linux can use clang or gcc |
 
 optional: `upx` for the `small` build profile.
@@ -160,7 +160,12 @@ writes that INI beside itself instead of using the OS configuration directory.
 
 ## runtime
 
-OpenTerm looks for `otm-agent` next to its own exe first, then on `PATH`. If missing, local shells still work; the SSH tab will return an error until the sidecar is found.
+OpenTerm loads `otm-agent` from the same directory as its executable. Keep the two
+files together for SSH and SFTP.
+
+The CMD Info command reports `%NUMBER_OF_PROCESSORS%`. On systems with multiple
+processor groups, that value may be smaller than the machine's total logical
+processor count.
 
 The settings button controls dark/light appearance and the default shell used
 for local tabs (PowerShell, WSL, Bash, or CMD). `Ctrl+T` opens a new tab for the

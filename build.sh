@@ -33,7 +33,7 @@ need cargo && need rustc && need zig && need go || {
 required toolchains:
   rust : https://rustup.rs
   zig  : https://ziglang.org/download/   (0.13+)
-  go   : https://go.dev/dl/              (1.22+)
+  go   : https://go.dev/dl/              (1.25+)
   cc   : clang or gcc
 
 EOF

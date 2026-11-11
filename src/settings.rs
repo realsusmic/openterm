@@ -47,6 +47,7 @@ impl VaultGraceUnit {
 pub struct Settings {
     pub theme: ThemeMode,
     pub default_shell: String,
+    pub terminal_font: Option<String>,
     pub vault_grace_value: u64,
     pub vault_grace_unit: VaultGraceUnit,
 }
@@ -60,6 +61,7 @@ impl Default for Settings {
             } else {
                 "bash".into()
             },
+            terminal_font: None,
             vault_grace_value: 1,
             vault_grace_unit: VaultGraceUnit::Day,
         }
@@ -134,7 +136,12 @@ impl Settings {
                 continue;
             };
             let key = key.trim().to_ascii_lowercase();
-            let value = value.trim().trim_matches(['"', '\'']).to_ascii_lowercase();
+            let value = value.trim();
+            if matches!(section.as_str(), "terminal" | "") && key == "font_family" {
+                settings.terminal_font = (!value.is_empty()).then(|| value.to_owned());
+                continue;
+            }
+            let value = value.trim_matches(['"', '\'']).to_ascii_lowercase();
 
             match (section.as_str(), key.as_str(), value.as_str()) {
                 ("appearance" | "", "theme", "dark") => settings.theme = ThemeMode::Dark,
@@ -188,8 +195,12 @@ impl Settings {
             .vault_grace_value
             .max(1)
             .min(self.vault_grace_unit.max_value());
+        let terminal_font = self
+            .terminal_font
+            .as_deref()
+            .map_or_else(String::new, |font| format!("font_family={font}\n"));
         format!(
-            "; OpenTerm settings\n[appearance]\ntheme={theme}\n\n[terminal]\ndefault_shell={}\n\n[vault]\nunlock_grace_value={grace_value}\nunlock_grace_unit={grace_unit}\n",
+            "; OpenTerm settings\n[appearance]\ntheme={theme}\n\n[terminal]\ndefault_shell={}\n{terminal_font}\n[vault]\nunlock_grace_value={grace_value}\nunlock_grace_unit={grace_unit}\n",
             self.default_shell,
         )
     }
@@ -211,12 +222,14 @@ mod tests {
         let expected = Settings {
             theme: ThemeMode::Light,
             default_shell: "wsl".into(),
+            terminal_font: Some("CaskaydiaCove Nerd Font Mono".into()),
             vault_grace_value: 3,
             vault_grace_unit: VaultGraceUnit::Week,
         };
         let loaded = Settings::from_ini(&expected.to_ini());
         assert_eq!(loaded.theme, expected.theme);
         assert_eq!(loaded.default_shell, expected.default_shell);
+        assert_eq!(loaded.terminal_font, expected.terminal_font);
         assert_eq!(loaded.vault_grace_value, expected.vault_grace_value);
         assert_eq!(loaded.vault_grace_unit, expected.vault_grace_unit);
     }
