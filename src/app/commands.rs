@@ -1,4 +1,7 @@
-use super::*;
+use super::{AppResult, CommandProfile, ConnectionType, TerminalKind};
+use crate::{pty, vault::UnlockError};
+use anyhow::{anyhow, Context};
+use std::process::Command;
 
 pub(super) fn platform_label(platform: &str) -> &str {
     let lower = platform.to_ascii_lowercase();

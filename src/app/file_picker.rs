@@ -1,4 +1,8 @@
-use super::*;
+use super::AppResult;
+#[cfg(not(target_os = "macos"))]
+use anyhow::anyhow;
+use anyhow::Context;
+use std::{path::Path, process::Command};
 
 pub(super) fn sync_root_too_broad(value: &str) -> bool {
     let value = value.trim();
