@@ -1,6 +1,7 @@
 # Rust, Zig, C, and Go build output
 /target/
 /dist/
+/releases/*.zip
 /agent/otm-agent
 /agent/otm-agent.exe
 /native/*.o
