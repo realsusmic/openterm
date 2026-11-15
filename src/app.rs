@@ -36,10 +36,9 @@ mod workspace;
 
 #[cfg(not(target_os = "macos"))]
 use chrome::window_edges;
-use chrome::{statusbar, titlebar};
+use chrome::{statusbar, titlebar, ResizeOverlay};
 use commands::os_unlock_error;
 use connection_ui::{host_key_dialog, rename_device_dialog, ssh_modal};
-use settings_ui::settings_dialog;
 use sidebar::sidebar;
 use terminal_fonts::TerminalFonts;
 use transfer_ui::{binary_file_dialog, transfer_dialog};
@@ -495,6 +494,14 @@ enum Act {
     RejectHostKey,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum SettingsTab {
+    #[default]
+    Closed,
+    Background,
+    Active,
+}
+
 pub struct OpenTerm {
     devices: Vec<Device>,
     selected: String,
@@ -505,7 +512,7 @@ pub struct OpenTerm {
     editor: Editor,
     show_editor: bool,
     modal: bool,
-    settings_open: bool,
+    settings_tab: SettingsTab,
     settings: Settings,
     terminal_fonts: TerminalFonts,
     available_terminals: Vec<TerminalKind>,
@@ -528,6 +535,7 @@ pub struct OpenTerm {
     vault: Option<Vault>,
     vault_ui: VaultState,
     window_maximized: bool,
+    resize_overlay: ResizeOverlay,
 }
 
 impl OpenTerm {
@@ -573,7 +581,7 @@ impl OpenTerm {
             editor: Editor::default(),
             show_editor: false,
             modal: false,
-            settings_open: false,
+            settings_tab: SettingsTab::Closed,
             settings,
             terminal_fonts: TerminalFonts::scan(cc.egui_ctx.clone()),
             available_terminals,
@@ -599,6 +607,7 @@ impl OpenTerm {
             vault,
             vault_ui,
             window_maximized: false,
+            resize_overlay: ResizeOverlay::default(),
         };
         if let Some(v) = &mut app.vault {
             if v.mode() == VaultMode::Os {
@@ -641,7 +650,9 @@ impl OpenTerm {
             }
             let cs = Modifiers::COMMAND | Modifiers::SHIFT;
             if i.consume_key(cs, Key::W) {
-                if let Some(id) = self.active {
+                if self.settings_tab == SettingsTab::Active {
+                    acts.push(Act::CloseSettings);
+                } else if let Some(id) = self.active {
                     acts.push(Act::Close(id));
                 }
             }
@@ -741,17 +752,7 @@ impl eframe::App for OpenTerm {
             }
         }
         vault_dialog(ctx, &mut self.vault_ui, &mut acts);
-        if self.settings_open && matches!(self.vault_ui, VaultState::Ready | VaultState::Idle) {
-            settings_dialog(
-                ctx,
-                &self.settings,
-                &self.available_terminals,
-                &self.terminal_fonts,
-                &mut acts,
-            );
-        }
         if self.modal
-            && !self.settings_open
             && self.rename_device.is_none()
             && matches!(self.vault_ui, VaultState::Ready | VaultState::Idle)
         {
@@ -784,6 +785,7 @@ impl eframe::App for OpenTerm {
 
         #[cfg(not(target_os = "macos"))]
         window_edges(ctx);
+        self.resize_overlay.show(ctx);
 
         if let Some((_, _, until)) = &self.flash {
             let left = until - ctx.input(|i| i.time);

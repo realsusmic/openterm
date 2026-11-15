@@ -2,7 +2,7 @@
 
 use super::commands::platform_label;
 use super::widgets::{icon_at, ui_f};
-use super::{Act, OpenTerm};
+use super::{Act, OpenTerm, SettingsTab};
 use crate::icons;
 use crate::theme::*;
 #[cfg(not(target_os = "macos"))]
@@ -97,12 +97,13 @@ pub(super) fn titlebar(ctx: &egui::Context, app: &mut OpenTerm, acts: &mut Vec<A
             }
 
             if let Some(settings_rect) = settings_rect {
+                let active = app.settings_tab == SettingsTab::Active;
                 if icon_at(
                     ui,
                     settings_rect,
                     Id::new("ot_settings"),
                     "settings",
-                    |p, c, col| icons::gear(p, c, if app.settings_open { fg() } else { col }),
+                    |p, c, col| icons::gear(p, c, if active { fg() } else { col }),
                 )
                 .clicked()
                 {
@@ -234,6 +235,76 @@ pub(super) fn statusbar(ctx: &egui::Context, app: &OpenTerm) {
         });
 }
 
+#[derive(Default)]
+pub(super) struct ResizeOverlay {
+    size: Option<(u32, u32)>,
+    changed_at: Option<f64>,
+}
+
+impl ResizeOverlay {
+    pub(super) fn show(&mut self, ctx: &egui::Context) {
+        const HOLD: f64 = 0.75;
+        const FADE: f64 = 0.20;
+
+        let (size, now) = ctx.input(|input| {
+            let rect = input
+                .viewport()
+                .inner_rect
+                .unwrap_or_else(|| input.screen_rect());
+            let pixels = rect.size() * input.pixels_per_point();
+            (
+                (pixels.x.round() as u32, pixels.y.round() as u32),
+                input.time,
+            )
+        });
+        if size.0 == 0 || size.1 == 0 {
+            return;
+        }
+        if self
+            .size
+            .replace(size)
+            .is_some_and(|previous| previous != size)
+        {
+            self.changed_at = Some(now);
+        }
+        let Some(changed_at) = self.changed_at else {
+            return;
+        };
+        let elapsed = now - changed_at;
+        if elapsed >= HOLD + FADE {
+            self.changed_at = None;
+            return;
+        }
+        let opacity = if elapsed < HOLD {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(HOLD - elapsed));
+            1.0
+        } else {
+            ctx.request_repaint();
+            (1.0 - (elapsed - HOLD) / FADE) as f32
+        };
+
+        let (width, height) = size;
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Tooltip,
+            Id::new("ot_resize_size"),
+        ));
+        let text = painter.layout_no_wrap(
+            format!("{width} × {height} px"),
+            mono(17.0),
+            fg().gamma_multiply(opacity),
+        );
+        let rect =
+            Rect::from_center_size(ctx.screen_rect().center(), text.size() + vec2(36.0, 24.0));
+        painter.rect(
+            rect,
+            Rounding::same(8.0),
+            bg3().gamma_multiply(opacity),
+            Stroke::new(1.0_f32, border_d().gamma_multiply(opacity)),
+        );
+        painter.galley(rect.center() - text.size() / 2.0, text, fg());
+    }
+}
+
 // borderless window: resize from the edges
 #[cfg(not(target_os = "macos"))]
 pub(super) fn window_edges(ctx: &egui::Context) {
@@ -279,5 +350,45 @@ pub(super) fn window_edges(ctx: &egui::Context) {
         if ctx.input(|i| i.pointer.primary_pressed()) {
             ctx.send_viewport_cmd(ViewportCommand::BeginResize(dir));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resize_overlay_reports_physical_size_at_center_and_expires() {
+        let ctx = egui::Context::default();
+        let mut overlay = ResizeOverlay::default();
+        let screen = |width| Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 480.0));
+        let mut frame = |width, time| {
+            let mut input = egui::RawInput {
+                screen_rect: Some(screen(width)),
+                time: Some(time),
+                ..Default::default()
+            };
+            input
+                .viewports
+                .get_mut(&input.viewport_id)
+                .unwrap()
+                .native_pixels_per_point = Some(1.25);
+            ctx.run(input, |ctx| overlay.show(ctx)).shapes
+        };
+
+        assert!(frame(800.0, 0.0).is_empty());
+        let shapes = frame(840.0, 0.2);
+        let text = shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text),
+                _ => None,
+            })
+            .expect("resizing should show the window size");
+        assert_eq!(text.galley.job.text, "1050 × 600 px");
+        assert_eq!(text.pos + text.galley.size() / 2.0, screen(840.0).center());
+
+        assert!(!frame(840.0, 1.05).is_empty());
+        assert!(frame(840.0, 1.2).is_empty());
     }
 }

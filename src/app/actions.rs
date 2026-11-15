@@ -5,8 +5,8 @@ use super::file_picker::{pick_local_folder, sync_root_too_broad};
 use super::files::suggested_download_path;
 use super::{
     resolved_terminal, Act, AuthMode, CommandProfile, ConnectionType, DeviceKind, OpenTerm,
-    PendingBinaryDownload, PendingTransfer, RenameDeviceDialog, SyncDirection, TransferDialog,
-    TransferMode, TransferResult, VaultState,
+    PendingBinaryDownload, PendingTransfer, RenameDeviceDialog, SettingsTab, SyncDirection,
+    TransferDialog, TransferMode, TransferResult, VaultState,
 };
 use crate::fs_tree::{self, Node, RemoteNode};
 use crate::ssh::{SshAuth, SshConfig};
@@ -22,6 +22,20 @@ use zeroize::{Zeroize, Zeroizing};
 
 impl OpenTerm {
     pub(super) fn apply(&mut self, ctx: &egui::Context, act: Act) {
+        if self.settings_tab == SettingsTab::Active
+            && matches!(
+                act,
+                Act::SelectDevice(_)
+                    | Act::NewSession(_)
+                    | Act::NewTerminal(_)
+                    | Act::Activate(_)
+                    | Act::OpenFile(_)
+                    | Act::RemoteLoad(..)
+            )
+        {
+            self.settings_tab = SettingsTab::Background;
+            ctx.memory_mut(|memory| memory.close_popup());
+        }
         match act {
             Act::SelectDevice(d) => {
                 self.active = self.sessions.iter().find(|s| s.device == d).map(|s| s.id);
@@ -140,8 +154,16 @@ impl OpenTerm {
                 self.editing_device = None;
                 self.form.password.zeroize();
             }
-            Act::OpenSettings => self.settings_open = true,
-            Act::CloseSettings => self.settings_open = false,
+            Act::OpenSettings => {
+                self.settings_tab = SettingsTab::Active;
+                ctx.memory_mut(|memory| memory.close_popup());
+            }
+            Act::CloseSettings => {
+                if self.settings_tab == SettingsTab::Active {
+                    ctx.memory_mut(|memory| memory.close_popup());
+                }
+                self.settings_tab = SettingsTab::Closed;
+            }
             Act::SetTheme(mode) => {
                 self.settings.theme = mode;
                 theme::apply(ctx, mode);

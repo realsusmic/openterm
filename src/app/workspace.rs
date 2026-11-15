@@ -1,7 +1,8 @@
 //! Terminal tabs and the editor pane.
 
+use super::settings_ui::settings_page;
 use super::widgets::{elide, icon_at, ui_f};
-use super::{resolved_terminal, Act, OpenTerm};
+use super::{resolved_terminal, Act, OpenTerm, SettingsTab};
 use crate::icons;
 use crate::theme::*;
 use egui::{pos2, vec2, Frame, Id, Pos2, Rect, Response, Rounding, Sense, Stroke, Ui};
@@ -22,27 +23,43 @@ pub(super) fn workspace(ctx: &egui::Context, app: &mut OpenTerm, acts: &mut Vec<
                         Stroke::new(1.0_f32, border()),
                     );
                     let mut x = rect.left() + 8.0;
-                    let show_tools = rect.width() >= 390.0;
+                    let show_tools =
+                        rect.width() >= 390.0 && app.settings_tab != SettingsTab::Active;
                     let tabs_right = if show_tools {
                         rect.right() - 140.0
                     } else {
                         rect.right() - 8.0
                     };
+                    if app.settings_tab != SettingsTab::Closed {
+                        let (response, closed, width) = tab(
+                            ui,
+                            pos2(x, rect.top() + 6.0),
+                            TabKind::Settings,
+                            "Settings",
+                            app.settings_tab == SettingsTab::Active,
+                            tabs_right - x,
+                        );
+                        if closed || response.middle_clicked() {
+                            acts.push(Act::CloseSettings);
+                        } else if response.clicked() {
+                            acts.push(Act::OpenSettings);
+                        }
+                        x += width + 4.0;
+                    }
                     for s in app.sessions.iter().filter(|s| s.device == app.selected) {
                         let remaining = tabs_right - x;
                         if remaining < 70.0 {
                             break;
                         }
-                        let active = app.active == Some(s.id);
-                        let live = s.backend.is_some();
+                        let active =
+                            app.settings_tab != SettingsTab::Active && app.active == Some(s.id);
                         let reserve_new_tab = if remaining >= 104.0 { 34.0 } else { 0.0 };
                         let (resp, closed, w) = tab(
                             ui,
                             pos2(x, rect.top() + 6.0),
-                            s.id,
+                            TabKind::Session(s.id, s.backend.is_some()),
                             &s.label,
                             active,
-                            live,
                             remaining - reserve_new_tab,
                         );
                         if closed {
@@ -173,6 +190,11 @@ pub(super) fn workspace(ctx: &egui::Context, app: &mut OpenTerm, acts: &mut Vec<
                     }
                 });
 
+            if app.settings_tab == SettingsTab::Active {
+                settings_page(ui, app, acts);
+                return;
+            }
+
             // breadcrumb
             egui::TopBottomPanel::top("ot_crumb")
                 .exact_height(32.0)
@@ -247,7 +269,7 @@ pub(super) fn workspace(ctx: &egui::Context, app: &mut OpenTerm, acts: &mut Vec<
                 .frame(Frame::none().fill(bg()))
                 .show_inside(ui, |ui| {
                     let area = ui.max_rect();
-                    let modal = app.modal || app.settings_open || app.binary_file_dialog.is_some();
+                    let modal = app.modal || app.binary_file_dialog.is_some();
                     let connection_error = app.connection_errors.get(&app.selected).cloned();
                     match app.active_session() {
                         Some(s) => {
@@ -350,15 +372,23 @@ pub(super) fn workspace(ctx: &egui::Context, app: &mut OpenTerm, acts: &mut Vec<
         });
 }
 
+enum TabKind {
+    Session(u64, bool),
+    Settings,
+}
+
 fn tab(
     ui: &mut Ui,
     at: Pos2,
-    id: u64,
+    kind: TabKind,
     label: &str,
     active: bool,
-    live: bool,
     max_width: f32,
 ) -> (Response, bool, f32) {
+    let id = match kind {
+        TabKind::Session(id, _) => Id::new(("ot_session_tab", id)),
+        TabKind::Settings => Id::new("ot_settings_tab"),
+    };
     let gal = ui.painter().layout_no_wrap(
         label.to_string(),
         ui_f(),
@@ -366,11 +396,11 @@ fn tab(
     );
     let w = (gal.size().x + 56.0).min(220.0).min(max_width.max(70.0));
     let rect = Rect::from_min_size(at, vec2(w, 32.0));
-    let resp = ui.interact(rect, Id::new(("ot_tab", id)), Sense::click());
+    let resp = ui.interact(rect, id, Sense::click());
     let xc = pos2(rect.right() - 14.0, rect.center().y - 1.0);
     let xresp = ui.interact(
         Rect::from_center_size(xc, vec2(18.0, 18.0)),
-        Id::new(("ot_tabx", id)),
+        id.with("close"),
         Sense::click(),
     );
     let p = ui.painter();
@@ -409,12 +439,20 @@ fn tab(
         );
     }
     let y = rect.center().y - 1.0;
-    icons::dot(
-        p,
-        pos2(rect.left() + 14.0, y),
-        3.2,
-        if live { signal() } else { fg_muted() },
-    );
+    let icon_center = pos2(rect.left() + 14.0, y);
+    match kind {
+        TabKind::Session(_, live) => {
+            icons::dot(
+                p,
+                icon_center,
+                3.2,
+                if live { signal() } else { fg_muted() },
+            );
+        }
+        TabKind::Settings => {
+            icons::gear(p, icon_center, if active { fg() } else { fg_muted() });
+        }
+    }
     let gal = elide(
         p,
         label,

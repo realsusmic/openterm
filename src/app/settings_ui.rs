@@ -1,92 +1,45 @@
 //! Appearance, terminal, and vault preferences.
 
 use super::terminal_fonts::TerminalFonts;
-use super::widgets::{primary_button, seg, terminal_seg};
-use super::{resolved_terminal, Act, TerminalKind};
+use super::widgets::{seg, terminal_seg};
+use super::{resolved_terminal, Act, OpenTerm, TerminalKind};
 use crate::settings::{Settings, ThemeMode, VaultGraceUnit};
 use crate::theme::*;
-use egui::{vec2, Color32, Frame, Id, Key, Margin, Rounding, Sense, Stroke};
+use egui::{vec2, Frame, Margin, Ui};
 
-pub(super) fn settings_dialog(
-    ctx: &egui::Context,
-    settings: &Settings,
-    available_terminals: &[TerminalKind],
-    terminal_fonts: &TerminalFonts,
-    acts: &mut Vec<Act>,
-) {
-    let screen = ctx.screen_rect();
-    egui::Area::new(Id::new("ot_settings_backdrop"))
-        .order(egui::Order::Middle)
-        .fixed_pos(screen.min)
-        .show(ctx, |ui| {
-            let response = ui.allocate_rect(screen, Sense::click());
-            ui.painter()
-                .rect_filled(screen, Rounding::ZERO, Color32::from_black_alpha(150));
-            if response.clicked() {
-                acts.push(Act::CloseSettings);
-            }
-        });
-
-    egui::Area::new(Id::new("ot_settings_dialog"))
-        .order(egui::Order::Foreground)
-        .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, -20.0))
-        .show(ctx, |ui| {
+pub(super) fn settings_page(ui: &mut Ui, app: &OpenTerm, acts: &mut Vec<Act>) {
+    egui::ScrollArea::vertical()
+        .id_salt("settings_body")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
             Frame::none()
-                .fill(bg2())
-                .stroke(Stroke::new(1.0_f32, border_d()))
-                .rounding(Rounding::same(12.0))
-                .inner_margin(Margin::same(22.0))
+                .inner_margin(Margin::same(24.0))
                 .show(ui, |ui| {
-                    ui.set_width(430.0);
-                    ui.label(
-                        egui::RichText::new("Settings")
-                            .font(medium(15.0))
-                            .color(fg()),
+                    ui.set_max_width(ui.available_width().min(500.0));
+                    settings_body(
+                        ui,
+                        &app.settings,
+                        &app.available_terminals,
+                        &app.terminal_fonts,
+                        acts,
                     );
-                    ui.label(
-                        egui::RichText::new("Appearance, terminal defaults, and vault security.")
-                            .color(fg_muted()),
-                    );
-                    ui.add_space(14.0);
-
-                    egui::ScrollArea::vertical()
-                        .id_salt("settings_body")
-                        .auto_shrink([false, true])
-                        .max_height((screen.height() - 160.0).max(100.0))
-                        .show(ui, |ui| {
-                            settings_body(ui, settings, available_terminals, terminal_fonts, acts);
-                        });
 
                     ui.add_space(14.0);
-                    settings_footer(ui, acts);
+                    let icon =
+                        egui::Image::new(egui::include_image!("../../assets/icons/github.svg"))
+                            .fit_to_exact_size(vec2(18.0, 18.0))
+                            .tint(fg());
+                    if ui
+                        .add(egui::Button::image(icon))
+                        .on_hover_text("Open OpenTerm on GitHub")
+                        .clicked()
+                    {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(
+                            "https://github.com/realsusmic/openterm",
+                        ));
+                    }
                 });
         });
-
-    if ctx.input(|input| input.key_pressed(Key::Escape)) {
-        acts.push(Act::CloseSettings);
-    }
-}
-
-fn settings_footer(ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-    ui.horizontal(|ui| {
-        let icon = egui::Image::new(egui::include_image!("../../assets/icons/github.svg"))
-            .fit_to_exact_size(vec2(18.0, 18.0))
-            .tint(fg());
-        if ui
-            .add(egui::Button::image(icon))
-            .on_hover_text("Open OpenTerm on GitHub")
-            .clicked()
-        {
-            ui.ctx().open_url(egui::OpenUrl::new_tab(
-                "https://github.com/realsusmic/openterm",
-            ));
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if primary_button(ui, "Done").clicked() {
-                acts.push(Act::CloseSettings);
-            }
-        });
-    });
 }
 
 fn settings_body(
